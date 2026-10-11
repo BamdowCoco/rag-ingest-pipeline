@@ -1,0 +1,30 @@
+# 构建上下文里不该进镜像 / 不该传给 daemon 的东西
+# 最要紧的一条：.env 里有口令，绝不能打进镜像层（镜像可能是公开的、会被缓存）
+.env
+.env.*
+!.env.example
+
+# 版本控制 / IDE
+.git
+.gitignore
+.idea
+.vscode
+
+# Python 产物
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# 测试缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 文档与测试：镜像只跑 app，不需要它们
+tests/
+docs/
+*.md

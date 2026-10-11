@@ -1,0 +1,24 @@
+# 依赖和项目配置
+[project]
+name = "ai-public-opinion-pipeline-api"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.142.2",
+    "uvicorn[standard]>=0.54.0",
+    "sqlalchemy[asyncio]>=2.0.45",
+#    "asyncmy",
+    "aiomysql>=0.3.2",
+    "pydantic>=2.13.5",
+    "pydantic-settings>=2.15.0",
+    "redis>=8.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+#  "pytest>=8",
+#  "pytest-asyncio>=0.23",
+  "httpx>=0.28.1",
+#  "aiosqlite>=0.20",
+#  "fakeredis>=2.23",
+]

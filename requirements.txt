@@ -1,0 +1,13 @@
+# 运行时依赖（镜像里只装这些）
+# 测试/开发依赖（pytest、httpx 等）不装进生产镜像，见 pyproject.toml 的 dev 组
+# 注意：pydantic-settings 会自动带上 python-dotenv（env_file 靠它读 .env），无需手写
+fastapi>=0.142.2
+uvicorn[standard]>=0.54.0
+sqlalchemy[asyncio]>=2.0.45
+aiomysql>=0.3.2
+# MySQL 8 默认 caching_sha2_password 认证，PyMySQL(aiomysql 的底座) 处理它必须要有 cryptography
+# 缺了会在连库时报 RuntimeError: 'cryptography' package is required ...
+cryptography>=42.0.0
+pydantic>=2.13.5
+pydantic-settings>=2.15.0
+redis>=8.1.0

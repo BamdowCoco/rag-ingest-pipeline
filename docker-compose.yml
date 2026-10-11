@@ -1,0 +1,88 @@
+# 定义多容器 Docker 应用：api + mysql + redis
+# 用法：docker compose up -d  →  docker compose ps（三个都 healthy）→  http://localhost:8000/docs
+#
+# 端口：容器内 mysql/redis 是 3306/6379，映射到宿主机 3307/6380，避开本机可能已在跑的实例
+services:
+  # ---------- FastAPI 应用 ----------
+  api:
+    build: .
+    container_name: opinion-api
+    ports:
+      - "8000:8000"
+    # 先用 env_file 把 .env 灌进去（里面是「本地口径」）
+    env_file:
+      - .env
+    # 再用 environment 覆盖 host/port 成「容器内口径」—— 这正演示了「同代码、异环境」
+    # 优先级：environment > env_file，所以下面这几行会盖掉 .env 里的同名项
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+    depends_on:
+      # service_healthy：等对方健康检查通过再启动，防止应用崩溃
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # slim 镜像里没有 curl/wget，但有 python，用它探 /health
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks: [backend]
+
+  # ---------- MySQL ----------
+  mysql:
+    image: mysql:8.0
+    container_name: opinion-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root123456   # 仅本地开发用
+      MYSQL_DATABASE: opinion           # 对应 .env 的 DB_NAME
+      MYSQL_USER: app                   # 对应 DB_USER
+      MYSQL_PASSWORD: app               # 对应 DB_PASSWORD
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "3307:3306"                     # 宿主机 3307 → 容器 3306
+    volumes:
+      - mysql_data:/var/lib/mysql       # 命名卷：容器删了数据还在
+    healthcheck:
+      # $$ 是 compose 的转义：传给容器后变成 $，再由容器内 shell 展开成真实口令
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+    networks: [backend]
+
+  # ---------- Redis ----------
+  redis:
+    image: redis:7-alpine
+    container_name: opinion-redis
+    command: ["redis-server", "--appendonly", "yes"]   # 开 AOF 持久化
+    ports:
+      - "6380:6379"                     # 宿主机 6380 → 容器 6379
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks: [backend]
+
+volumes:
+  mysql_data:
+  redis_data:
+
+networks:
+  backend:
+    driver: bridge
