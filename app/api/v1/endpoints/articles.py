@@ -1,11 +1,12 @@
 """
 文章接口。
 
-阶段 3：GET 走 service→repo 直接查库（不加缓存）；POST 先占位，阶段 5 实现。
+GET 走 service→repo 查库（阶段 7 再加缓存）；POST 走完整管道（清洗→去重→入库）。
 """
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Query, status
 
 from app.api.deps import get_article_service
+from app.models.article_clean import ArticleClean
 from app.schemas.article import ArticleCreate, ArticleOut
 from app.schemas.common import Page
 from app.services.article_service import ArticleService
@@ -29,5 +30,5 @@ async def list_articles(
 async def create_article(
     payload: ArticleCreate,
     service: ArticleService = Depends(get_article_service),
-) -> ArticleOut:
-    raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, detail="阶段 5 实现：清洗→去重→入库")
+) -> ArticleClean:
+    return await service.ingest(payload)
