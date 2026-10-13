@@ -50,3 +50,8 @@ def list_cache_key(version: int, *, page: int, limit: int, source: str | None) -
 def article_cache_key(article_id: int) -> str:
     """单篇文章的缓存键。"""
     return f"article:{article_id}"
+
+
+def stats_cache_key(version: int) -> str:
+    """统计缓存键。与列表共用同一个版本号 —— 一次 INCR 同时作废两者。"""
+    return f"articles:stats:v{version}"

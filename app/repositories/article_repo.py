@@ -57,6 +57,35 @@ class ArticleRepo:
         result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
 
+    # ---------- 聚合（阶段 8） ----------
+
+    async def count_by_source(self, limit: int = 10) -> list[tuple[str, int]]:
+        """按来源分组取 top N（条数降序）。"""
+        stmt = (
+            select(ArticleClean.source, func.count().label("n"))
+            .group_by(ArticleClean.source)
+            .order_by(func.count().desc())
+            .limit(limit)
+        )
+        result = await self.db.execute(stmt)
+        return [(row.source, row.n) for row in result.all()]
+
+    async def count_since(self, start: datetime, end: datetime) -> int:
+        """
+        区间计数。
+
+        必须是**范围写法**：`fetched_at >= start AND fetched_at <= end` —— 这样能吃到
+        `fetched_at` 上的索引。写成 `func.date(fetched_at) == ...` 会对列做函数运算，
+        **索引直接失效**（且 MySQL 没有 `date_trunc`，那是 Postgres 的）。
+        """
+        stmt = (
+            select(func.count())
+            .select_from(ArticleClean)
+            .where(ArticleClean.fetched_at >= start, ArticleClean.fetched_at <= end)
+        )
+        result = await self.db.execute(stmt)
+        return int(result.scalar_one())
+
     # ---------- 写入（阶段 5） ----------
 
     async def insert_raw(

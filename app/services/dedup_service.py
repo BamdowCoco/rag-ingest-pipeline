@@ -27,3 +27,16 @@ async def rollback_mark(redis: Redis, content_hash: str) -> None:
     其实没有这条记录，你还会觉得莫名其妙。
     """
     await redis.srem(DEDUP_KEY, content_hash)
+
+
+DEDUP_REJECTED_KEY = "articles:dedup_rejected"   # 判重拒收累计计数
+
+
+async def incr_rejected(redis: Redis) -> None:
+    """判重拒收时 +1（统计接口读它）。"""
+    await redis.incr(DEDUP_REJECTED_KEY)
+
+
+async def get_rejected_count(redis: Redis) -> int:
+    v = await redis.get(DEDUP_REJECTED_KEY)
+    return int(v) if v is not None else 0

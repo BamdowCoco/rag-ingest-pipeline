@@ -23,10 +23,17 @@ from app.services.cache_service import (
     cache_set,
     get_list_version,
     list_cache_key,
+    stats_cache_key,
 )
 from app.services.clean_service import clean_article
-from app.services.dedup_service import check_and_mark, rollback_mark
+from app.services.dedup_service import (
+    check_and_mark,
+    get_rejected_count,
+    incr_rejected,
+    rollback_mark,
+)
 from app.services.lock_service import LockNotAcquired, article_lock
+from app.utils.time import beijing_today_utc_range
 
 
 class ArticleService:
@@ -86,6 +93,30 @@ class ArticleService:
         await cache_set(self.redis, cache_key, out.model_dump(mode="json"), ttl=settings.cache_ttl)
         return out
 
+    async def get_stats(self) -> dict:
+        """
+        统计：总数 / 按来源 top10 / 今日新增 / 判重拒收累计。
+
+        整体缓存，与列表共用同一个版本号 —— 一次 INCR 同时作废两者。
+        「今日」按【北京时间】算（库里存的是 UTC，所以这里做一次边界换算）。
+        """
+        version = await get_list_version(self.redis)
+        cache_key = stats_cache_key(version)
+        cached = await cache_get(self.redis, cache_key)
+        if cached is not None:
+            return cached
+
+        today_start, today_end = beijing_today_utc_range()
+        by_source = await self.repo.count_by_source(limit=10)
+        payload = {
+            "total": await self.repo.count_articles(),
+            "by_source": [{"source": s, "count": n} for s, n in by_source],
+            "today_count": await self.repo.count_since(today_start, today_end),
+            "dedup_rejected": await get_rejected_count(self.redis),
+        }
+        await cache_set(self.redis, cache_key, payload, ttl=settings.cache_ttl)
+        return payload
+
     # ---------- 写 ----------
 
     async def ingest(self, payload: ArticleCreate) -> ArticleClean:
@@ -107,6 +138,7 @@ class ArticleService:
             async with article_lock(self.redis, content_hash):
                 # ① 快路径：Redis 原子判重
                 if not await check_and_mark(self.redis, content_hash):
+                    await incr_rejected(self.redis)
                     raise HTTPException(status.HTTP_409_CONFLICT, detail="文章已存在（判重拒收）")
 
                 try:
@@ -139,6 +171,7 @@ class ArticleService:
                     # 【必须 rollback】：不回滚，session 就废了，后续任何操作都会报错。
                     await self.db.rollback()
                     await rollback_mark(self.redis, content_hash)   # 撤掉快路径的错误占位
+                    await incr_rejected(self.redis)                 # 唯一索引拦下的也算拒收
                     raise HTTPException(
                         status.HTTP_409_CONFLICT, detail="文章已存在（唯一索引拦下）"
                     ) from None
