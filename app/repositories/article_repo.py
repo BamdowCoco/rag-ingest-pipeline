@@ -51,6 +51,12 @@ class ArticleRepo:
         result = await self.db.execute(stmt)
         return int(result.scalar_one())
 
+    async def get_by_id(self, article_id: int) -> ArticleClean | None:
+        """按主键取单篇（阶段 7 的单篇查询用）。"""
+        stmt = select(ArticleClean).where(ArticleClean.id == article_id)
+        result = await self.db.execute(stmt)
+        return result.scalar_one_or_none()
+
     # ---------- 写入（阶段 5） ----------
 
     async def insert_raw(

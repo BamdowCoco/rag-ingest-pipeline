@@ -1,12 +1,11 @@
 """
 文章接口。
 
-GET 走 service→repo 查库（阶段 7 再加缓存）；POST 走完整管道（清洗→去重→入库）。
+GET 列表 / GET 单篇走 Cache-Aside（阶段 7）；POST 走完整管道（清洗→加锁→判重→入库）。
 """
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Path, Query, status
 
 from app.api.deps import get_article_service
-from app.models.article_clean import ArticleClean
 from app.schemas.article import ArticleCreate, ArticleOut
 from app.schemas.common import Page
 from app.services.article_service import ArticleService
@@ -30,5 +29,13 @@ async def list_articles(
 async def create_article(
     payload: ArticleCreate,
     service: ArticleService = Depends(get_article_service),
-) -> ArticleClean:
+) -> ArticleOut:
     return await service.ingest(payload)
+
+
+@router.get("/{article_id}", response_model=ArticleOut, summary="查询单篇文章")
+async def get_article(
+    article_id: int = Path(..., ge=1),
+    service: ArticleService = Depends(get_article_service),
+) -> ArticleOut:
+    return await service.get_article(article_id)
