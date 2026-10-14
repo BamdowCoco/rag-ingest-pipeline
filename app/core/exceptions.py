@@ -38,9 +38,14 @@ class DocumentNotFoundError(AppError):
     """文档不存在"""
 
 
+class ChunkNotFoundError(AppError):
+    """分块不存在"""
+
+
 # 业务异常 → HTTP 状态码。这张表只存在于这个（HTTP）边界模块里。
 _ERROR_STATUS = {
     DocumentNotFoundError: status.HTTP_404_NOT_FOUND,
+    ChunkNotFoundError: status.HTTP_404_NOT_FOUND,
     DuplicateDocumentError: status.HTTP_409_CONFLICT,
     DocumentInProgressError: status.HTTP_409_CONFLICT,
     EmptyContentError: status.HTTP_422_UNPROCESSABLE_CONTENT,

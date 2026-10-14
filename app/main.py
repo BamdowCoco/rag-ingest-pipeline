@@ -4,6 +4,8 @@ FastAPI 入口
 lifespan 是「应用启动到关闭」的生命周期钩子：yield 之前是启动逻辑，yield 之后是关停逻辑。
 启动时探活 Redis、建表——有问题就在启动阶段暴露，别等第一个请求才炸。
 """
+import asyncio
+import contextlib
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -17,6 +19,7 @@ from app.core.logging import setup_logging
 from app.db.init_db import init_models
 from app.db.session import engine
 from app.infra.redis_client import close_redis, redis_client
+from app.services.reclaimer import reclaim_loop
 
 setup_logging()  # 必须在其它模块打日志之前调用
 logger = logging.getLogger(__name__)
@@ -36,9 +39,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await init_models()         # 建表（阶段 2 有模型后才会真正建出表）
     logger.info("数据库表已就绪")
 
+    # 后台回收任务：起一个 asyncio task（为什么独立出来，见 reclaimer.py 的说明）
+    reclaimer = asyncio.create_task(reclaim_loop())
+
     yield
 
     # ---------- 关停 ----------
+    # 顺序要紧：先取消后台任务、再关连接池。反过来的话，任务可能拿到已 dispose 的池。
+    reclaimer.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await reclaimer
     await close_redis()         # 释放 Redis 连接池
     await engine.dispose()      # 释放数据库连接池
     logger.info("已关闭 %s", settings.app_name)

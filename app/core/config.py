@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     cache_ttl: int = 60          # 列表/统计缓存秒数（阶段 7、8）
     lock_ttl_ms: int = 10000     # 分布式锁毫秒级 TTL（阶段 6）
 
+    # ---------- 后台任务 ----------
+    reclaim_interval_seconds: int = 60    # 回收任务多久跑一次
+    reclaim_after_seconds: int = 300      # processing 卡住超过多久算 worker 挂了
+
     # ---------- 派生 DSN（用 @property 现拼，不重复存字段） ----------
     @property
     def database_url(self) -> str:
