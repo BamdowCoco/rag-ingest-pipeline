@@ -13,7 +13,7 @@ from typing import Any
 
 from redis.asyncio import Redis
 
-_LIST_VERSION_KEY = "articles:list:version"
+_LIST_VERSION_KEY = "documents:list:version"
 
 
 async def cache_get(redis: Redis, key: str) -> Any | None:
@@ -44,14 +44,14 @@ def list_cache_key(version: int, *, page: int, limit: int, source: str | None) -
     特意【不含 q】：q 是自由文本，键空间无上限 —— 任意客户端能用随机 q 刷出无穷多个键
     把 Redis 撑爆，而且带 q 的请求命中率本来就极低。带 q 的查询直接走库。
     """
-    return f"articles:list:v{version}:{page}:{limit}:{source or ''}"
+    return f"documents:list:v{version}:{page}:{limit}:{source or ''}"
 
 
-def article_cache_key(article_id: int) -> str:
-    """单篇文章的缓存键。"""
-    return f"article:{article_id}"
+def document_cache_key(document_id: int) -> str:
+    """单篇文档的缓存键。"""
+    return f"document:{document_id}"
 
 
 def stats_cache_key(version: int) -> str:
     """统计缓存键。与列表共用同一个版本号 —— 一次 INCR 同时作废两者。"""
-    return f"articles:stats:v{version}"
+    return f"documents:stats:v{version}"

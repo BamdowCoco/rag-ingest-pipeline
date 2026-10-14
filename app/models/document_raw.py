@@ -1,4 +1,4 @@
-"""原始留痕表：管道第一站，收到的数据原样存下（不清洗），日后清洗规则变了还能重跑。"""
+"""原始留痕表：管道第一站，收到的数据原样存下（不标准化），日后标准化规则变了还能重跑。"""
 from datetime import datetime
 
 from sqlalchemy import JSON, DateTime, String, Text
@@ -8,8 +8,8 @@ from app.db.base import Base
 from app.utils.time import utcnow
 
 
-class ArticleRaw(Base):
-    __tablename__ = "article_raw"
+class DocumentRaw(Base):
+    __tablename__ = "document_raw"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     source: Mapped[str] = mapped_column(String(50), nullable=False)

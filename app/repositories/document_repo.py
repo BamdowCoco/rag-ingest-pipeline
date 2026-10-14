@@ -1,59 +1,59 @@
 """
-文章仓储：对 article_clean 的读写集中在这里，只写「查询」，不含业务判断。
+文档仓储：对 document_clean 的读写集中在这里，只写「查询」，不含业务判断。
 """
 from datetime import datetime
 
 from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.article_clean import ArticleClean
-from app.models.article_raw import ArticleRaw
+from app.models.document_clean import DocumentClean
+from app.models.document_raw import DocumentRaw
 
 
-class ArticleRepo:
+class DocumentRepo:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
 
     @staticmethod
     def _filters(stmt: Select, *, source: str | None, q: str | None) -> Select:
         if source:
-            stmt = stmt.where(ArticleClean.source == source)
+            stmt = stmt.where(DocumentClean.source == source)
         if q:
             # ilike 在 MySQL 上就是 LIKE + 列的排序规则（utf8mb4_unicode_ci 本身不区分大小写）
-            stmt = stmt.where(ArticleClean.title.ilike(f"%{q}%"))
+            stmt = stmt.where(DocumentClean.title.ilike(f"%{q}%"))
         return stmt
 
-    async def list_articles(
+    async def list_documents(
         self, *, page: int, limit: int, source: str | None = None, q: str | None = None
-    ) -> list[ArticleClean]:
+    ) -> list[DocumentClean]:
         """
-            SELECT * FROM article_clean as ac
+            SELECT * FROM document_clean as ac
             WHERE ...
             ORDER BY ac.fetched_at desc, ac.id desc
             OFFSET ...
             LIMIT ...
         """
-        stmt = select(ArticleClean)
+        stmt = select(DocumentClean)
         stmt = self._filters(stmt, source=source, q=q)
         # 排序要稳定：fetched_at 可能重复，补一个 id 兜底
-        stmt = stmt.order_by(ArticleClean.fetched_at.desc(), ArticleClean.id.desc())
+        stmt = stmt.order_by(DocumentClean.fetched_at.desc(), DocumentClean.id.desc())
         stmt = stmt.offset((page - 1) * limit).limit(limit)
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
 
-    async def count_articles(self, *, source: str | None = None, q: str | None = None) -> int:
+    async def count_documents(self, *, source: str | None = None, q: str | None = None) -> int:
         """
-            SELECT COUNT(*) FROM article_clean
+            SELECT COUNT(*) FROM document_clean
             WHERE ...
         """
-        stmt = select(func.count()).select_from(ArticleClean)
+        stmt = select(func.count()).select_from(DocumentClean)
         stmt = self._filters(stmt, source=source, q=q)
         result = await self.db.execute(stmt)
         return int(result.scalar_one())
 
-    async def get_by_id(self, article_id: int) -> ArticleClean | None:
+    async def get_by_id(self, document_id: int) -> DocumentClean | None:
         """按主键取单篇（阶段 7 的单篇查询用）。"""
-        stmt = select(ArticleClean).where(ArticleClean.id == article_id)
+        stmt = select(DocumentClean).where(DocumentClean.id == document_id)
         result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
 
@@ -62,8 +62,8 @@ class ArticleRepo:
     async def count_by_source(self, limit: int = 10) -> list[tuple[str, int]]:
         """按来源分组取 top N（条数降序）。"""
         stmt = (
-            select(ArticleClean.source, func.count().label("n"))
-            .group_by(ArticleClean.source)
+            select(DocumentClean.source, func.count().label("n"))
+            .group_by(DocumentClean.source)
             .order_by(func.count().desc())
             .limit(limit)
         )
@@ -80,8 +80,8 @@ class ArticleRepo:
         """
         stmt = (
             select(func.count())
-            .select_from(ArticleClean)
-            .where(ArticleClean.fetched_at >= start, ArticleClean.fetched_at <= end)
+            .select_from(DocumentClean)
+            .where(DocumentClean.fetched_at >= start, DocumentClean.fetched_at <= end)
         )
         result = await self.db.execute(stmt)
         return int(result.scalar_one())
@@ -90,8 +90,8 @@ class ArticleRepo:
 
     async def insert_raw(
         self, *, source: str, raw_title: str, raw_content: str, payload: dict | None = None
-    ) -> ArticleRaw:
-        row = ArticleRaw(
+    ) -> DocumentRaw:
+        row = DocumentRaw(
             source=source, raw_title=raw_title, raw_content=raw_content, payload=payload
         )
         self.db.add(row)
@@ -107,25 +107,25 @@ class ArticleRepo:
         content: str,
         author: str | None,
         url: str | None,
-        published_at: datetime | None,
+        doc_updated_at: datetime | None,
         char_count: int,
         clean_version: int,
-        sentiment: str | None = None,
-        category: str | None = None,
+        doc_type: str | None = None,
+        tags: list[str] | None = None,
         ai_summary: str | None = None,
-    ) -> ArticleClean:
-        row = ArticleClean(
+    ) -> DocumentClean:
+        row = DocumentClean(
             raw_id=raw_id,
             source=source,
             title=title,
             content=content,
             author=author,
             url=url,
-            published_at=published_at,
+            doc_updated_at=doc_updated_at,
             char_count=char_count,
             clean_version=clean_version,
-            sentiment=sentiment,
-            category=category,
+            doc_type=doc_type,
+            tags=tags,
             ai_summary=ai_summary,
         )
         self.db.add(row)

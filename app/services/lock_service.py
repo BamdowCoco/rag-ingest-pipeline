@@ -1,5 +1,5 @@
 """
-分布式锁：按 content_hash 粒度，防止同一篇文章被并发重复处理。
+分布式锁：按 content_hash 粒度，防止同一篇文档被并发重复处理。
 
 三个要点：
 - `SET key token NX PX ttl` —— NX 保证互斥，PX 保证「崩溃安全」（持有者挂了锁最终会自己过期）
@@ -28,12 +28,12 @@ end
 
 
 class LockNotAcquired(Exception):
-    """没抢到锁：已经有别的请求在处理同一篇文章。"""
+    """没抢到锁：已经有别的请求在处理同一篇文档。"""
 
 
 def lock_key(content_hash: str) -> str:
     """按 hash 粒度上锁——绝不是全局锁，否则并发能力直接归零。"""
-    return f"lock:article:{content_hash}"
+    return f"lock:doc:{content_hash}"
 
 
 async def acquire_lock(redis: Redis, key: str, ttl_ms: int) -> str | None:
@@ -57,13 +57,13 @@ async def release_lock(redis: Redis, key: str, token: str) -> bool:
 #   它自动帮你把这个函数包装成一个满足上述协议的对象，而不用手写 __aenter__ / __aexit__。
 
 @asynccontextmanager
-async def article_lock(
+async def document_lock(
     redis: Redis, content_hash: str, ttl_ms: int | None = None
 ) -> AsyncIterator[None]:
     """
     按 content_hash 加锁的上下文；抢不到锁抛 `LockNotAcquired`。
 
-        async with article_lock(redis, content_hash):
+        async with document_lock(redis, content_hash):
             ... 「判重 → 落库」的临界区 ...
 
     TTL 默认取 `settings.lock_ttl_ms`。TTL 是「崩溃安全」的代价：持有者若真的挂了，

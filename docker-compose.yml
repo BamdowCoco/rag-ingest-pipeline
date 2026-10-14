@@ -6,7 +6,7 @@ services:
   # ---------- FastAPI 应用 ----------
   api:
     build: .
-    container_name: opinion-api
+    container_name: rag-api
     ports:
       - "8000:8000"
     # 先用 env_file 把 .env 灌进去（里面是「本地口径」）
@@ -39,10 +39,10 @@ services:
   # ---------- MySQL ----------
   mysql:
     image: mysql:8.0
-    container_name: opinion-mysql
+    container_name: rag-mysql
     environment:
       MYSQL_ROOT_PASSWORD: root123456   # 仅本地开发用
-      MYSQL_DATABASE: opinion           # 对应 .env 的 DB_NAME
+      MYSQL_DATABASE: rag_ingest           # 对应 .env 的 DB_NAME
       MYSQL_USER: app                   # 对应 DB_USER
       MYSQL_PASSWORD: app               # 对应 DB_PASSWORD
     command:
@@ -65,7 +65,7 @@ services:
   # ---------- Redis ----------
   redis:
     image: redis:7-alpine
-    container_name: opinion-redis
+    container_name: rag-redis
     command: ["redis-server", "--appendonly", "yes"]   # 开 AOF 持久化
     ports:
       - "6380:6379"                     # 宿主机 6380 → 容器 6379

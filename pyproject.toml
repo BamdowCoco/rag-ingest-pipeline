@@ -1,6 +1,6 @@
 # 依赖和项目配置
 [project]
-name = "ai-public-opinion-pipeline-api"
+name = "rag-ingest-pipeline"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [

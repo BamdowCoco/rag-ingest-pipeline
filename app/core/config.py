@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     )
 
     # ---------- 应用 ----------
-    app_name: str = "AI 舆情数据管道 API"
+    app_name: str = "企业知识库 RAG 接入管道"
     debug: bool = False
     api_port: int = 8000
     log_level: str = "INFO"
@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     db_port: int = 3307
     db_user: str = "app"
     db_password: str = "app"
-    db_name: str = "opinion"
+    db_name: str = "rag_ingest"
 
     # ---------- Redis ----------
     redis_host: str = "localhost"

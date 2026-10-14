@@ -1,8 +1,8 @@
 """
-文本清洗（纯函数：无 DB / Redis / 网络，容易测）。
+文本标准化（纯函数：无 DB / Redis / 网络，容易测）。
 
-按序执行，clean_article() 把整条线串起来，
-顺便算出 content_hash —— 保证「先清洗后哈希」
+按序执行，normalize_document() 把整条线串起来，
+顺便算出 content_hash —— 保证「先标准化后哈希」
 """
 import html
 import re
@@ -10,10 +10,10 @@ import unicodedata
 
 from app.utils.hashing import make_content_hash
 
-# 清洗规则改了就把版本号 +1，日后能识别某一行是哪个版本洗出来的
-CLEAN_VERSION = 1
+# 标准化规则改了就把版本号 +1，日后能识别某一行是哪个版本洗出来的
+NORMALIZER_VERSION = 1
 
-MAX_TITLE_LEN = 255      # 对应 article_clean.title 的列宽
+MAX_TITLE_LEN = 255      # 对应 document_clean.title 的列宽
 MAX_CONTENT_LEN = 20000  # 正文上限（列是 Text，这里是业务上自我克制）
 
 # ① 整块删除 <script>…</script> / <style>…</style>
@@ -22,7 +22,7 @@ _RE_SCRIPT_STYLE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.S | re.I)
 # ② HTML 注释（不删的话注释里的 '>' 会干扰后面的标签正则）
 _RE_COMMENT = re.compile(r"<!--.*?-->", re.S)
 # ③ 块级边界 → 换行（保住段落）
-_RE_BLOCK_BREAK = re.compile(r"</(?:p|div|li|h[1-6]|tr|section|article|blockquote)>|<br\s*/?>", re.I)
+_RE_BLOCK_BREAK = re.compile(r"</(?:p|div|li|h[1-6]|tr|section|document|blockquote)>|<br\s*/?>", re.I)
 # ④ 其余标签 → 空格（用空格而非空串：'<p>a</p><p>b</p>' 才不会粘成 'ab'）
 _RE_TAG = re.compile(r"<[^>]+>")
 # ⑤ 零宽 / BOM / 软连字符：肉眼看不见，却会让哈希不一致
@@ -52,14 +52,14 @@ def _strip_markup(raw: object) -> str:
     return s
 
 
-def clean_title(raw: object) -> str:
+def normalize_title(raw: object) -> str:
     """标题：折成单行，截断到 255。"""
     s = _strip_markup(raw)
     s = re.sub(r"\s+", " ", s).strip()        # 所有空白（含换行）折成单个空格
     return s[:MAX_TITLE_LEN]
 
 
-def clean_content(raw: object) -> str:
+def normalize_content(raw: object) -> str:
     """正文：保留段落 —— 行内空白折成单空格，连续空行最多留一个。"""
     s = _strip_markup(raw)
     s = _RE_INLINE_WS.sub(" ", s)                       # 行内空白 → 单空格
@@ -69,19 +69,19 @@ def clean_content(raw: object) -> str:
     return s[:MAX_CONTENT_LEN]
 
 
-def clean_article(raw: dict) -> dict:
+def normalize_document(raw: dict) -> dict:
     """
-    清洗编排：raw dict → 清洗后的字段 + 哈希。
+    标准化编排：raw dict → 标准化后的字段 + 哈希。
 
     返回 {"title", "content", "char_count", "clean_version", "content_hash"}。
     hash 在这里算，且基于【截断后】的文本 —— 与真正入库的内容完全一致。
     """
-    title = clean_title(raw.get("title"))
-    content = clean_content(raw.get("content"))
+    title = normalize_title(raw.get("title"))
+    content = normalize_content(raw.get("content"))
     return {
         "title": title,
         "content": content,
         "char_count": len(content),
-        "clean_version": CLEAN_VERSION,
+        "clean_version": NORMALIZER_VERSION,
         "content_hash": make_content_hash(title, content),
     }

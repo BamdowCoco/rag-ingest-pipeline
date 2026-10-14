@@ -1,4 +1,4 @@
-"""通用模型：分页信封。GET /articles 统一返回这个形状，泛型复用。"""
+"""通用模型：分页信封。GET /documents 统一返回这个形状，泛型复用。"""
 from typing import Generic, TypeVar
 
 from pydantic import BaseModel

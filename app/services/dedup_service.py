@@ -2,16 +2,16 @@
 去重：Redis Set 是【快路径】，MySQL 唯一索引是【权威】。
 
 快路径挡掉绝大多数重复、省一次数据库往返；但 Redis 会被清空/淘汰/重启丢数据，
-不能当真相 —— 最终由 article_dedup.content_hash 的唯一索引说了算。
+不能当真相 —— 最终由 document_dedup.content_hash 的唯一索引说了算。
 """
 from redis.asyncio import Redis
 
-DEDUP_KEY = "dedup:articles"   # 存「已见过的 content_hash」的 Set
+DEDUP_KEY = "dedup:documents"   # 存「已见过的 content_hash」的 Set
 
 
 async def check_and_mark(redis: Redis, content_hash: str) -> bool:
     """
-    原子地「判断并占位」：SADD 返回 1 = 之前没有（新文章），0 = 已存在（重复）。
+    原子地「判断并占位」：SADD 返回 1 = 之前没有（新文档），0 = 已存在（重复）。
 
     必须用 SADD 的**返回值**一步判断。写成 `SISMEMBER` 再 `SADD` 会在这两步之间留下
     竞态窗口：两个请求可能同时读到「不存在」，然后都去插入。
@@ -29,7 +29,7 @@ async def rollback_mark(redis: Redis, content_hash: str) -> None:
     await redis.srem(DEDUP_KEY, content_hash)
 
 
-DEDUP_REJECTED_KEY = "articles:dedup_rejected"   # 判重拒收累计计数
+DEDUP_REJECTED_KEY = "documents:dedup_rejected"   # 判重拒收累计计数
 
 
 async def incr_rejected(redis: Redis) -> None:

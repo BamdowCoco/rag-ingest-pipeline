@@ -22,27 +22,27 @@ class AppError(Exception):
         super().__init__(self.detail)
 
 
-class DuplicateArticleError(AppError):
-    """文章已存在（判重拒收）"""
+class DuplicateDocumentError(AppError):
+    """文档已存在（判重拒收）"""
 
 
-class ArticleInProgressError(AppError):
-    """该文章正在被另一个请求处理，请稍后重试"""
+class DocumentInProgressError(AppError):
+    """该文档正在被另一个请求处理，请稍后重试"""
 
 
 class EmptyContentError(AppError):
-    """清洗后正文为空"""
+    """标准化后正文为空"""
 
 
-class ArticleNotFoundError(AppError):
-    """文章不存在"""
+class DocumentNotFoundError(AppError):
+    """文档不存在"""
 
 
 # 业务异常 → HTTP 状态码。这张表只存在于这个（HTTP）边界模块里。
 _ERROR_STATUS = {
-    ArticleNotFoundError: status.HTTP_404_NOT_FOUND,
-    DuplicateArticleError: status.HTTP_409_CONFLICT,
-    ArticleInProgressError: status.HTTP_409_CONFLICT,
+    DocumentNotFoundError: status.HTTP_404_NOT_FOUND,
+    DuplicateDocumentError: status.HTTP_409_CONFLICT,
+    DocumentInProgressError: status.HTTP_409_CONFLICT,
     EmptyContentError: status.HTTP_422_UNPROCESSABLE_CONTENT,
 }
 
