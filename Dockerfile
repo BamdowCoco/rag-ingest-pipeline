@@ -11,7 +11,8 @@ WORKDIR /app
 # ---- 先只拷依赖清单并安装 ----
 # 利用层缓存：只要 requirements.txt 没变，改代码时这一层直接命中缓存，不用重装依赖
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+ && python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')"
 
 # ---- 再拷代码 ----
 # 这里只拷 app/（不拷 .env：镜像里不留口令，配置由 compose 的 env_file/environment 注入）

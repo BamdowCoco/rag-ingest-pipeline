@@ -6,6 +6,7 @@ GET 列表 / GET 单篇走 Cache-Aside（阶段 7）；POST 走完整管道（�
 from fastapi import APIRouter, Depends, Path, Query, status
 
 from app.api.deps import get_document_service
+from app.schemas.chunk import ChunkOut
 from app.schemas.document import DocumentCreate, DocumentOut
 from app.schemas.common import Page
 from app.services.document_service import DocumentService
@@ -39,3 +40,14 @@ async def get_document(
     service: DocumentService = Depends(get_document_service),
 ) -> DocumentOut:
     return await service.get_document(document_id)
+
+
+@router.get("/{document_id}/chunks", response_model=Page[ChunkOut], summary="查询文档的分块")
+async def list_document_chunks(
+    document_id: int = Path(..., ge=1),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    service: DocumentService = Depends(get_document_service),
+) -> Page[ChunkOut]:
+    items, total = await service.list_chunks(document_id, page=page, limit=limit)
+    return Page[ChunkOut](items=items, total=total, page=page, limit=limit)

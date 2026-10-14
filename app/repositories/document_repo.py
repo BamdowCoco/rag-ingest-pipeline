@@ -3,9 +3,10 @@
 """
 from datetime import datetime
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, func, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.document_chunk import DocumentChunk
 from app.models.document_clean import DocumentClean
 from app.models.document_raw import DocumentRaw
 
@@ -74,9 +75,9 @@ class DocumentRepo:
         """
         区间计数。
 
-        必须是**范围写法**：`fetched_at >= start AND fetched_at <= end` —— 这样能吃到
+        必须是范围写法：`fetched_at >= start AND fetched_at <= end` —— 这样能吃到
         `fetched_at` 上的索引。写成 `func.date(fetched_at) == ...` 会对列做函数运算，
-        **索引直接失效**（且 MySQL 没有 `date_trunc`，那是 Postgres 的）。
+        索引直接失效（且 MySQL 没有 `date_trunc`，那是 Postgres 的）。
         """
         stmt = (
             select(func.count())
@@ -131,3 +132,38 @@ class DocumentRepo:
         self.db.add(row)
         await self.db.flush()   # 同样只为拿 clean.id 给 dedup.clean_id 用
         return row
+
+    # ---------- chunk（阶段 B） ----------
+
+    async def insert_chunks(self, document_id: int, chunks: list[dict]) -> int:
+        """
+        批量插入 chunk，返回插入条数。
+
+        与 raw/clean 那两条不同：这里不需要回读自增 id，所以可以是**真批量** ——
+        一次 executemany 往返，而不是 N 次 INSERT。
+        """
+        if not chunks:
+            return 0
+        await self.db.execute(
+            insert(DocumentChunk),
+            [{"document_id": document_id, **c} for c in chunks],
+        )
+        return len(chunks)
+
+    async def list_chunks(self, document_id: int, *, page: int, limit: int) -> list[DocumentChunk]:
+        stmt = (
+            select(DocumentChunk)
+            .where(DocumentChunk.document_id == document_id)
+            .order_by(DocumentChunk.chunk_index)      # 按 chunk_index 有序，翻页才稳定
+            .offset((page - 1) * limit)
+            .limit(limit)
+        )
+        return list((await self.db.execute(stmt)).scalars().all())
+
+    async def count_chunks(self, document_id: int) -> int:
+        stmt = (
+            select(func.count())
+            .select_from(DocumentChunk)
+            .where(DocumentChunk.document_id == document_id)
+        )
+        return int((await self.db.execute(stmt)).scalar_one())

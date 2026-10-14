@@ -7,7 +7,9 @@ sqlalchemy[asyncio]>=2.0.45
 aiomysql>=0.3.2
 # MySQL 8 默认 caching_sha2_password 认证，PyMySQL(aiomysql 的底座) 处理它必须要有 cryptography
 # 缺了会在连库时报 RuntimeError: 'cryptography' package is required ...
-cryptography>=42.0.0
+cryptography>=50.0.0
 pydantic>=2.13.5
 pydantic-settings>=2.15.0
 redis>=8.1.0
+# 切块要精确数 token（下游的上下文上限与 embedding 计费都按 token）
+tiktoken>=0.7.0

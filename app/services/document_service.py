@@ -7,6 +7,7 @@
 阶段 7：列表与单篇都走 Cache-Aside；写入成功后 bump 列表版本号。
 阶段 9：service 不再抛 HTTPException（改为业务异常，HTTP 映射在 core/exceptions.py）；
         补处理日志；插入 AI 接缝 enrich（失败不阻断入库）。
+阶段 B：落库后接上【切块】；新增分块查询（纯 TTL 缓存）。
 """
 import logging
 
@@ -24,8 +25,10 @@ from app.core.exceptions import (
 from app.models.document_clean import DocumentClean
 from app.repositories.document_repo import DocumentRepo
 from app.repositories.dedup_repo import DedupRepo
+from app.schemas.chunk import ChunkOut
 from app.schemas.document import DocumentCreate, DocumentOut
 from app.services.cache_service import (
+    chunk_list_cache_key,
     document_cache_key,
     bump_list_version,
     cache_get,
@@ -34,6 +37,7 @@ from app.services.cache_service import (
     list_cache_key,
     stats_cache_key,
 )
+from app.services.chunk_service import make_chunks
 from app.services.normalize_service import normalize_document
 from app.services.dedup_service import (
     check_and_mark,
@@ -89,8 +93,8 @@ class DocumentService:
         """
         单篇查询（Cache-Aside）。
 
-        注意：本项目文档**写入后永不修改**，所以单条缓存用纯 TTL 就够，
-        不需要「写时删」—— 失效策略取决于**数据可变性**，可变数据才需要写时失效。
+        注意：本项目文档写入后永不修改，所以单条缓存用纯 TTL 就够，
+        不需要「写时删」—— 失效策略取决于数据可变性，可变数据才需要写时失效。
         """
         cache_key = document_cache_key(document_id)
         cached = await cache_get(self.redis, cache_key)
@@ -129,6 +133,33 @@ class DocumentService:
         }
         await cache_set(self.redis, cache_key, payload, ttl=settings.cache_ttl)
         return payload
+
+    async def list_chunks(self, document_id: int, *, page: int, limit: int) -> tuple[list[dict], int]:
+        """
+        分块列表（Cache-Aside，纯 TTL）。
+
+        为什么不像列表/统计那样用版本号：chunk 是**一次写入、永不修改**的 ——
+        没有「写后失效」这回事，TTL 自然过期就够了。
+        这正是「失效策略取决于数据可变性」的正面例子。
+        """
+        cache_key = chunk_list_cache_key(document_id, page=page, limit=limit)
+        cached = await cache_get(self.redis, cache_key)
+        if cached is not None:
+            return cached["items"], cached["total"]
+
+        rows = await self.repo.list_chunks(document_id, page=page, limit=limit)
+        total = await self.repo.count_chunks(document_id)
+        # 空结果时再确认文档是否存在 —— 免得把「id 打错了」显示成「文档存在但没有块」。
+        # 只在空结果时多查一次，常见路径不吃这个开销。
+        if total == 0 and await self.repo.get_by_id(document_id) is None:
+            raise DocumentNotFoundError()
+
+        payload = {
+            "items": [ChunkOut.model_validate(r).model_dump(mode="json") for r in rows],
+            "total": total,
+        }
+        await cache_set(self.redis, cache_key, payload, ttl=settings.cache_ttl)
+        return payload["items"], payload["total"]
 
     # ---------- 写 ----------
 
@@ -183,6 +214,12 @@ class DocumentService:
                         clean_version=cleaned["clean_version"],
                         **ai,                                  # doc_type / tags / ai_summary
                     )
+                    # ③ 切块：文档落库后立刻切。chunk 与文档在【同一个事务】里 ——
+                    #    要么文档和它的块都在，要么都不在，不留半截数据。
+                    #    切块是纯函数、毫秒级，放在锁内不影响吞吐。
+                    chunks = make_chunks(cleaned)
+                    await self.repo.insert_chunks(clean_row.id, chunks)
+
                     await self.dedup_repo.insert_dedup(content_hash, clean_row.id)
 
                     # ③ 一次 commit 落定整笔
@@ -204,7 +241,7 @@ class DocumentService:
         #    （单条缓存不用管：文档写入后不会改，TTL 自然过期即可）
         await bump_list_version(self.redis)
         logger.info(
-            "ingest 成功 hash=%s clean_id=%s 字数=%s",
-            content_hash[:12], clean_row.id, cleaned["char_count"],
+            "ingest 成功 hash=%s clean_id=%s 字数=%s 块数=%d",
+            content_hash[:12], clean_row.id, cleaned["char_count"], len(chunks),
         )
         return clean_row

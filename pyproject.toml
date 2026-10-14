@@ -1,18 +1,11 @@
-# 依赖和项目配置
+# 项目配置（运行依赖在 requirements.txt，见下）
 [project]
 name = "rag-ingest-pipeline"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = [
-    "fastapi>=0.142.2",
-    "uvicorn[standard]>=0.54.0",
-    "sqlalchemy[asyncio]>=2.0.45",
-#    "asyncmy",
-    "aiomysql>=0.3.2",
-    "pydantic>=2.13.5",
-    "pydantic-settings>=2.15.0",
-    "redis>=8.1.0",
-]
+# 运行依赖只在 requirements.txt 里维护 —— 那是唯一被读取的地方
+# （Dockerfile 的 pip install -r，以及 README「本地开发」里的同一条命令）。
+# 这里不再重复列一份，免得改依赖时要同步两个文件。
 
 [project.optional-dependencies]
 dev = [
