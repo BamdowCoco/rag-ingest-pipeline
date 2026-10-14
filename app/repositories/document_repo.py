@@ -139,7 +139,7 @@ class DocumentRepo:
         """
         批量插入 chunk，返回插入条数。
 
-        与 raw/clean 那两条不同：这里不需要回读自增 id，所以可以是**真批量** ——
+        与 raw/clean 那两条不同：这里不需要回读自增 id，所以可以是 **真批量** ——
         一次 executemany 往返，而不是 N 次 INSERT。
         """
         if not chunks:

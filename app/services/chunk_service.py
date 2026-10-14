@@ -6,7 +6,7 @@
 策略：递归字符分割（Recursive Character Splitting），从「最自然的边界」往下降级：
   ① 段落 `\n\n`     一段话装得下就整段成块
   ② 句子 `。！？；`  段落超限才退到这一级，尽量把完整句子装进预算
-  ③ 单字符         句子还超限（罕见）才硬切 —— 到这一级是**按 token 切**的
+  ③ 单字符         句子还超限（罕见）才硬切 —— 到这一级是 **按 token 切** 的
 
 【将来】若切块参数需要反复试，就该像 `clean_version` 那样给 chunk 记一个
 `chunker_version` —— 否则无法知道哪些块是用旧参数切的、该不该重切。
@@ -57,7 +57,7 @@ def _split_recursive(text: str, size: int, separators: list[str]) -> list[str]:
 
 
 def _token_tail(text: str, n_tokens: int) -> str:
-    """取 text 的**最后 n_tokens 个 token** 对应的文本 —— 用来做重叠。"""
+    """取 text 的 **最后 n_tokens 个 token** 对应的文本 —— 用来做重叠。"""
     if n_tokens <= 0:
         return ""
     ids = enc.encode(text)
@@ -93,7 +93,7 @@ def split_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
     文本 → 块列表。size / overlap 的单位都是 token。
 
     边界情况：完全没有分隔符的文本（如无标点的长串）会一路降级到 token 硬切，
-    此时块与块**不会有重叠** —— 没有语义边界时，重叠任意内容收益很低。
+    此时块与块 **不会有重叠** —— 没有语义边界时，重叠任意内容收益很低。
     """
     if not text or not text.strip():
         return []

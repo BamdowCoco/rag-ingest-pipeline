@@ -13,7 +13,7 @@ async def check_and_mark(redis: Redis, content_hash: str) -> bool:
     """
     原子地「判断并占位」：SADD 返回 1 = 之前没有（新文档），0 = 已存在（重复）。
 
-    必须用 SADD 的**返回值**一步判断。写成 `SISMEMBER` 再 `SADD` 会在这两步之间留下
+    必须用 SADD 的 **返回值** 一步判断。写成 `SISMEMBER` 再 `SADD` 会在这两步之间留下
     竞态窗口：两个请求可能同时读到「不存在」，然后都去插入。
     """
     added = await redis.sadd(DEDUP_KEY, content_hash)

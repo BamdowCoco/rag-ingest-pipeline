@@ -4,8 +4,8 @@ Token 计数（精确）。
 用 tiktoken 实打实编码一次、数 token —— 不再自己估算。
 下游受约束的就是 token（模型上下文上限、embedding 计费），所以这里必须准。
 
-【部署提醒】tiktoken 第一次 `get_encoding` 会**联网下载 BPE 词表**并缓存到本地。
-容器里为了不在运行时才发现没网，Dockerfile 在**构建期**就预热了一次。
+【部署提醒】tiktoken 第一次 `get_encoding` 会 **联网下载 BPE 词表** 并缓存到本地。
+容器里为了不在运行时才发现没网，Dockerfile 在 **构建期** 就预热了一次。
 """
 import tiktoken
 
