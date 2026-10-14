@@ -5,13 +5,22 @@
 阶段 5：ingest() —— 清洗 → 判重(快路径) → 三表落库。
 阶段 6：给 ingest 的临界区套上按 hash 粒度的分布式锁。
 阶段 7：列表与单篇都走 Cache-Aside；写入成功后 bump 列表版本号。
+阶段 9：service 不再抛 HTTPException（改为业务异常，HTTP 映射在 core/exceptions.py）；
+        补处理日志；插入 AI 接缝 enrich（失败不阻断入库）。
 """
-from fastapi import HTTPException, status
+import logging
+
 from redis.asyncio import Redis
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.exceptions import (
+    ArticleInProgressError,
+    ArticleNotFoundError,
+    DuplicateArticleError,
+    EmptyContentError,
+)
 from app.models.article_clean import ArticleClean
 from app.repositories.article_repo import ArticleRepo
 from app.repositories.dedup_repo import DedupRepo
@@ -32,8 +41,11 @@ from app.services.dedup_service import (
     incr_rejected,
     rollback_mark,
 )
+from app.services.enrich_service import enrich
 from app.services.lock_service import LockNotAcquired, article_lock
 from app.utils.time import beijing_today_utc_range
+
+logger = logging.getLogger(__name__)
 
 
 class ArticleService:
@@ -87,7 +99,8 @@ class ArticleService:
 
         obj = await self.repo.get_by_id(article_id)
         if obj is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="文章不存在")
+            logger.info("文章不存在 id=%s", article_id)
+            raise ArticleNotFoundError()
 
         out = ArticleOut.model_validate(obj)
         await cache_set(self.redis, cache_key, out.model_dump(mode="json"), ttl=settings.cache_ttl)
@@ -127,10 +140,12 @@ class ArticleService:
         raw = payload.model_dump()
         cleaned = clean_article(raw)
         content_hash = cleaned["content_hash"]
+        logger.info("ingest 开始 source=%s hash=%s", raw["source"], content_hash[:12])
 
         # 清洗后正文为空 → 拒收。放锁外做，省一次加锁（反正它不涉及竞态）。
         if not cleaned["content"]:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail="清洗后正文为空")
+            logger.info("拒收：清洗后正文为空 hash=%s", content_hash[:12])
+            raise EmptyContentError()
 
         try:
             # ---------- 临界区：只有「判重 → 落库」需要互斥 ----------
@@ -139,9 +154,14 @@ class ArticleService:
                 # ① 快路径：Redis 原子判重
                 if not await check_and_mark(self.redis, content_hash):
                     await incr_rejected(self.redis)
-                    raise HTTPException(status.HTTP_409_CONFLICT, detail="文章已存在（判重拒收）")
+                    logger.info("拒收：判重（Redis 快路径）hash=%s", content_hash[:12])
+                    raise DuplicateArticleError()
 
                 try:
+                    # ---- AI 接缝：判重之后、落库之前 ----
+                    # enrich 内部已兜住所有异常，失败返回三列 None，不会阻断入库
+                    ai = await enrich(cleaned)
+
                     # ② 三表顺序落库：raw → clean → dedup（对应三表管道）
                     #    payload 用 mode="json" —— datetime 得变成字符串，JSON 列才存得进去；
                     #    而 published_at 那列要的是真 datetime，所以两个 dump 各取所需
@@ -161,6 +181,7 @@ class ArticleService:
                         published_at=raw.get("published_at"),
                         char_count=cleaned["char_count"],
                         clean_version=cleaned["clean_version"],
+                        **ai,                                  # sentiment / category / ai_summary
                     )
                     await self.dedup_repo.insert_dedup(content_hash, clean_row.id)
 
@@ -172,16 +193,18 @@ class ArticleService:
                     await self.db.rollback()
                     await rollback_mark(self.redis, content_hash)   # 撤掉快路径的错误占位
                     await incr_rejected(self.redis)                 # 唯一索引拦下的也算拒收
-                    raise HTTPException(
-                        status.HTTP_409_CONFLICT, detail="文章已存在（唯一索引拦下）"
-                    ) from None
+                    logger.warning("拒收：判重（唯一索引兜底）hash=%s", content_hash[:12])
+                    raise DuplicateArticleError() from None
         except LockNotAcquired:
-            # 已有别的请求在跑同一篇：立刻回 409，让调用方稍后重试
-            raise HTTPException(
-                status.HTTP_409_CONFLICT, detail="该文章正在处理中，请稍后重试"
-            ) from None
+            # 已有别的请求在跑同一篇：立刻报 409，让调用方稍后重试
+            logger.info("未拿到锁（同篇正在处理）hash=%s", content_hash[:12])
+            raise ArticleInProgressError() from None
 
         # ④ 有新数据了：版本号 +1，所有旧列表缓存瞬间失效
         #    （单条缓存不用管：文章写入后不会改，TTL 自然过期即可）
         await bump_list_version(self.redis)
+        logger.info(
+            "ingest 成功 hash=%s clean_id=%s 字数=%s",
+            content_hash[:12], clean_row.id, cleaned["char_count"],
+        )
         return clean_row

@@ -110,6 +110,9 @@ class ArticleRepo:
         published_at: datetime | None,
         char_count: int,
         clean_version: int,
+        sentiment: str | None = None,
+        category: str | None = None,
+        ai_summary: str | None = None,
     ) -> ArticleClean:
         row = ArticleClean(
             raw_id=raw_id,
@@ -121,6 +124,9 @@ class ArticleRepo:
             published_at=published_at,
             char_count=char_count,
             clean_version=clean_version,
+            sentiment=sentiment,
+            category=category,
+            ai_summary=ai_summary,
         )
         self.db.add(row)
         await self.db.flush()   # 同样只为拿 clean.id 给 dedup.clean_id 用
