@@ -87,6 +87,19 @@ class DocumentRepo:
         result = await self.db.execute(stmt)
         return int(result.scalar_one())
 
+    async def count_chunks_by_status(self) -> list[tuple[str, int]]:
+        """
+        按 embedding_status 分组计数 —— 就是看板上的「向量化积压」（pending 的那部分）。
+
+        一次 GROUP BY 拿全，而不是发三次 COUNT；状态就三种，结果最多三行。
+        """
+        stmt = (
+            select(DocumentChunk.embedding_status, func.count().label("n"))
+            .group_by(DocumentChunk.embedding_status)
+        )
+        result = await self.db.execute(stmt)
+        return [(row.embedding_status, row.n) for row in result.all()]
+
     # ---------- 写入（阶段 5） ----------
 
     async def insert_raw(

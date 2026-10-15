@@ -1,0 +1,8 @@
+# 测试专用依赖 —— 只装进 Dockerfile 的 test stage，绝不进生产镜像。
+# （生产镜像只装 requirements.txt，所以那里的 api 里 import pytest 应当失败。）
+
+pytest>=8
+# 0.24+ 才有 asyncio_default_*_loop_scope 这两个 ini 选项（见 pyproject.toml）
+pytest-asyncio>=0.24
+# 0.28 起 AsyncClient 不再接受 app= 简写，测试里显式用 ASGITransport
+httpx>=0.28.1

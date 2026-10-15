@@ -6,7 +6,11 @@
 services:
   # ---------- FastAPI 应用 ----------
   api:
-    build: .
+    # 【必须钉 target】：多阶段 Dockerfile 默认只建【最后一个】stage。
+    # 不钉的话 api 会去建 test stage（把 pytest 带进生产镜像）。
+    build:
+      context: .
+      target: runtime
     container_name: rag-api
     ports:
       - "8000:8000"
@@ -61,6 +65,36 @@ services:
       api:
         condition: service_healthy
     restart: unless-stopped
+    networks: [backend]
+
+  # ---------- 测试（profile 隔离：只有显式 --profile test 才会跑）----------
+  # 用法：docker compose --profile test run --rm test
+  #    或限定范围：docker compose --profile test run --rm test pytest -q tests/test_bulk_ingest.py
+  # 一次性任务：不设 container_name / restart / ports。
+  test:
+    build:
+      context: .
+      target: test
+    profiles: ["test"]
+    env_file:
+      - .env
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: rag_ingest_test     # 覆盖 .env 的 rag_ingest：测试绝不碰生产库
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: "15"               # 独享 redis db 号（生产是 0）；清库只用 flushdb 不用 flushall
+      DB_ROOT_PASSWORD: root123456 # 建 rag_ingest_test 要 root 权限（app 用户没这个库的权限）
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # 挂载测试目录：改测试后直接重跑即可，不必每次 `--build`
+    # （注意 `docker compose run` 默认【复用已有镜像】，不重建 —— 所以挂载很省事）
+    volumes:
+      - ./tests:/app/tests
     networks: [backend]
 
   # ---------- MySQL ----------

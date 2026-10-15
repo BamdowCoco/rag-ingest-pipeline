@@ -24,7 +24,10 @@ venv/
 .coverage
 htmlcov/
 
-# 文档与测试：镜像只跑 app，不需要它们
-tests/
+# 文档：镜像不需要
 docs/
 *.md
+
+# 注意：tests/ 【不能】排除 —— test stage 要 `COPY tests/` 进去。
+# .dockerignore 会先过滤构建上下文，被排除的路径连 COPY 都看不见（会直接构建失败）。
+# runtime stage 只 COPY app/，所以留着 tests/ 不影响生产镜像的内容。

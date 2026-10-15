@@ -244,6 +244,20 @@ docker compose exec -T mysql mysql -uroot -proot123456 -e "
 ```
 期望：**同步器疯狂推、worker 并发认领不重复，`document_clean` 只有几行、chunk 状态从 `pending` 流向 `done`。**
 
+### 5. 跑测试
+
+```bash
+docker compose --profile test run --rm test
+# 限定范围：docker compose --profile test run --rm test pytest -q tests/test_bulk_ingest.py
+```
+
+测试跑在**独立库** `rag_ingest_test` + redis 的 db 15 上，**不碰生产数据**。
+用真 MySQL/Redis 而不是 SQLite/fakeredis —— 因为 `SKIP LOCKED` 与 Lua 释放锁是 MySQL/Redis 专有的，
+被测的正是这两处。
+
+> `tests/` 是**挂载**进测试容器的，改完测试直接重跑即可，不必 `--build`。
+> 生产镜像里没有 pytest（那是 `test` stage 才装的）—— 校验方式：`docker compose run --rm --no-deps api python -c "import pytest"` 应当报 `ModuleNotFoundError`。
+
 ### 端口说明
 容器内 MySQL/Redis 是 3306/6379，**映射到宿主机 3307/6380**，避开本机已有的实例。容器内互连用服务名（`mysql:3306` / `redis:6379`）。
 
@@ -257,7 +271,7 @@ docker compose exec -T mysql mysql -uroot -proot123456 -e "
 - [x] **B** 切块：新增 `document_chunk` 表 + 切块服务（段落优先 + overlap），管道接上切块
 - [x] **C** 异步任务分发：`/chunks/claim` + `/complete`（`SKIP LOCKED`），worker 可并发认领
 - [x] **D** 批量摄入 + 同步器 + worker 容器（`syncer` / `embedder`，可 `--scale`）
-- [ ] **E** 叙事重写（README + 架构说明）
+- [x] **E** 叙事重写（README + 架构说明）+ 补齐自动化测试
 
 ---
 

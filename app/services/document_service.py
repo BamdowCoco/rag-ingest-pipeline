@@ -115,10 +115,14 @@ class DocumentService:
 
     async def get_stats(self) -> dict:
         """
-        统计：总数 / 按来源 top10 / 今日新增 / 判重拒收累计。
+        统计：总数 / 按来源 top10 / 今日新增 / 判重拒收累计 / **chunk 状态分布** 。
 
         整体缓存，与列表共用同一个版本号 —— 一次 INCR 同时作废两者。
         「今日」按【北京时间】算（库里存的是 UTC，所以这里做一次边界换算）。
+
+        注意 chunk_status 的陈旧度：版本号只在【文档写入】时 +1，而 claim/complete
+        不动版本号，所以「向量化积压」最多陈旧一个 cache_ttl（默认 60s）。
+        看板指标 60s 粒度可接受，也与 total/today_count 的陈旧度一致 —— 不为它破例。
         """
         version = await get_list_version(self.redis)
         cache_key = stats_cache_key(version)
@@ -128,11 +132,13 @@ class DocumentService:
 
         today_start, today_end = beijing_today_utc_range()
         by_source = await self.repo.count_by_source(limit=10)
+        chunk_status = await self.repo.count_chunks_by_status()
         payload = {
             "total": await self.repo.count_documents(),
             "by_source": [{"source": s, "count": n} for s, n in by_source],
             "today_count": await self.repo.count_since(today_start, today_end),
             "dedup_rejected": await get_rejected_count(self.redis),
+            "chunk_status": [{"status": s, "count": n} for s, n in chunk_status],
         }
         await cache_set(self.redis, cache_key, payload, ttl=settings.cache_ttl)
         return payload

@@ -10,8 +10,19 @@ requires-python = ">=3.11"
 [project.optional-dependencies]
 dev = [
   "pytest>=8",
-#  "pytest-asyncio>=0.23",
+  "pytest-asyncio>=0.24",
   "httpx>=0.28.1",
 #  "aiosqlite>=0.20",
 #  "fakeredis>=2.23",
 ]
+
+# 测试配置：只对 Dockerfile 的 test stage 生效（测试镜像会 COPY 这个文件）。
+# 生产镜像不含 pytest，也就不会读到这段。
+[tool.pytest.ini_options]
+# auto：async 测试与 async fixture 都不用再写 @pytest.mark.asyncio
+asyncio_mode = "auto"
+# 关键：把 fixture 与测试都钉在【同一个 session 级事件循环】上。
+# app 的 engine / redis 连接池是模块级的，绑定在首个使用它的循环上；
+# 若测试各用各的 function 级循环，会报 "attached to a different loop"。
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
