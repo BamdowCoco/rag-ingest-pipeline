@@ -24,8 +24,9 @@
 
 | 方法 | 路径 | 作用 |
 |---|---|---|
-| POST | `/api/v1/documents` | 提交单篇文档。**新建 → `201`；内容已存在 → `200`（去重，不重复切块）** |
+| POST | `/api/v1/documents` | 提交文档（**`external_id` 必填**）。**新建 → `201`；内容没变 → `200`；同 id 改了内容 → `200`（更新）** |
 | POST | `/api/v1/documents/bulk` | **批量提交**（同步器的真实调用方式，上限 200 篇） |
+| POST | `/api/v1/documents/delete` | **删除信号**（按 `source + external_id`，**幂等**，恒回 `200`） |
 | GET | `/api/v1/documents` | 文档分页查询（`page/limit/source/q`），走 Redis 缓存 |
 | GET | `/api/v1/documents/{id}` | 单篇详情，走 Cache-Aside |
 | GET | `/api/v1/documents/{id}/chunks` | **分块列表**（分页），走 Cache-Aside |
@@ -56,25 +57,35 @@ content_hash = sha256(title + "\n" + cleaned_content)
 
 **这里去重省下的不只是数据库往返，还有下游的 embedding 费用**——所以它值得做两层。
 
-### 3. 批量摄入：把 N 次判重往返压成 1 次（pipeline）
+### 3. 更新语义与「文档身份」—— 为什么光有内容指纹不够
 
-同步器一次推几百篇（`POST /documents/bulk`），**逐条**判重就是几百次 Redis 往返。
-`bulk_ingest` 用 `pipeline` 把这些 `SADD` **一次发出去**：
+一开始只有 `content_hash` 一个键，它同时被当成 **去重键** （这份内容见过吗）和 **身份键** （这是同一篇吗）。
+结果 **系统表达不了「更新」** ：文档改了内容 → hash 变了 → 只能新增一行，旧行成孤儿。
 
-```python
-pipe = redis.pipeline()
-for h in hashes:
-    pipe.sadd("dedup:documents", h)     # 每条 SADD 各自返回 1 / 0
-flags = await pipe.execute()            # ← 一次往返，拿到逐条的「是否新增」
-```
+所以摄入契约里加了 **`external_id`（源系统的文档 ID，必填）** ，并单独建一张 `document_source` 身份表：
+一个源文档一行、`(source, external_id)` 唯一。`document_clean` 从此 **一行 = 一个版本** ，
+只有 `superseded_at IS NULL` 的那行是当前版本。于是「同一篇改过了」终于能表达出来：
 
-**N 次往返 → 1 次**。而且每条 `SADD` 仍然是**原子的**——pipeline 只是把命令打包发送，
-并没有把多条命令合成一个非原子操作，所以不存在 `SISMEMBER` + `SADD` 那种两步竞态。
+| 情况 | 行为 |
+|---|---|
+| 身份不存在 | **新增** （先过下面那道内容准入） |
+| 身份在、内容没变 | **跳过** （回 `200`） |
+| 身份在、内容变了 | **更新** ：新增一个版本，旧版本与旧 chunk 一并作废 |
 
-> **批量里为什么反而【不】加分布式锁？** 一次加锁 ≈ 2 次往返/篇（`SET NX PX` + Lua 释放），
-> 逐篇加锁会把 pipeline 省下的往返**又加回去**。而 `SADD` 本身就是一次**原子的预留**
-> （只有一个人拿到 1），唯一索引仍是最终兜底——锁在这里只剩代价、没有收益。
-> 单篇则相反：锁能把「并发同篇」从一次数据库往返 + 异常，变成一次**快速失败**，划算。
+> **为什么唯一约束不能直接建在 `document_clean` 上？** 那里同一个 `external_id` 有 **多行版本** ，
+> 唯一索引根本立不住。身份和版本是两件事 —— 一张表装不下，所以有了 `document_source`。
+
+**内容去重没被删掉，只是换了位置**：`document_dedup.content_hash` 唯一 + Redis Set 快路径，
+现在只在一个 **新文档进门** 时问一句「这份内容是不是已经属于别人了」（多源转载就靠它挡）。
+**更新 / 复活是版本操作、不参与内容准入** —— 否则它们的新内容正好与别人一样时，会把自己的更新卡死。
+
+**还有一条「身份版本快路径」**：Redis 里存 `身份 → {clean_id, content_hash}`。
+同步器周期性重推**没变**的文档（最主要的那路流量）命中它就直接回 `200` —— **不查库、也不去抢那把
+`SELECT ... FOR UPDATE` 行锁**（没这一步，每次重推都要抢锁、还互相排队）。
+它沿用「快路径可以错、权威必须在 DB」这个模式，但 **失败模式更重** ：
+这份缓存错了是 **「漏一次更新」** ，不是去重 SET 那种「多拒一次」。所以它 **write-through**
+（DB 提交成功后才写）+ TTL 兜底 + 删除时清掉。
+
 
 ### 4. 按内容哈希粒度的分布式锁
 
@@ -219,7 +230,7 @@ docker compose ps         # 各服务应为 healthy / running
 ```bash
 curl -s -w '\n%{http_code}\n' -X POST http://localhost:8000/api/v1/documents \
   -H 'Content-Type: application/json' \
-  --data-binary '{"source":"feishu","title":"部署手册","content":"第一步…第二步…","url":"https://example.com/doc/1"}'
+  --data-binary '{"source":"feishu","external_id":"feishu-doc-001","title":"部署手册","content":"第一步…第二步…","url":"https://example.com/doc/1"}'
 ```
 
 > 若宿主访问不通（Windows + WSL 的端口转发问题），改用 `docker compose exec` 从容器内部打——本项目日常验证走的就是这条路：

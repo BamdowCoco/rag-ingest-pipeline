@@ -1,4 +1,8 @@
-"""标准化后正文：管道第二站，存标准化（去 HTML / 全角转半角 / 折叠空白…）后的结果。"""
+"""标准化后正文：管道第二站，存标准化（去 HTML / 全角转半角 / 折叠空白…）后的结果。
+
+**一行 = 一个版本** ，不是一篇文档 —— 同一篇文档更新后会有多行，其中只有一行是
+当前版本（`superseded_at IS NULL`）。身份在 `document_source`。
+"""
 from datetime import datetime
 
 from sqlalchemy import JSON, DateTime, ForeignKey, String, Text
@@ -15,8 +19,15 @@ class DocumentClean(Base):
     raw_id: Mapped[int] = mapped_column(
         ForeignKey("document_raw.id", ondelete="CASCADE"), nullable=False
     )
+    # 指向身份行；可空 —— 没带 external_id 的文档没有身份，走老的「只新增」路径
+    source_id: Mapped[int | None] = mapped_column(
+        ForeignKey("document_source.id", ondelete="CASCADE"), index=True, nullable=True
+    )
     # source 放在这里：阶段 7 列表要按它过滤、阶段 8 统计要按它分组，省一次 join
     source: Mapped[str] = mapped_column(String(50), index=True, nullable=False)
+    # 与 source 同理的反规范化：出参/列表要显示它，省一次 join 到 document_source。
+    # 对某一行版本而言它是【不可变】的（这行永远属于同一个身份），所以不存在同步问题。
+    external_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     title: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     author: Mapped[str | None] = mapped_column(String(120), nullable=True)
@@ -25,6 +36,12 @@ class DocumentClean(Base):
     fetched_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True, nullable=False)
     char_count: Mapped[int] = mapped_column(default=0, nullable=False)
     clean_version: Mapped[int] = mapped_column(default=1, nullable=False)  # 标准化规则改了就把版本号 +1
+
+    # 本版本的指纹。必须自己存一份 —— document_dedup 的 hash 是全局唯一，
+    # 且它记住的 clean_id 在版本作废之后就指错了，不能拿来判断"当前版本内容变了没"。
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 非 NULL = 「我已不是当前版本」。列表 / 统计一律把它过滤掉。
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     # ---------- AI 接缝（阶段 9 才填，先留可空，接大模型时不用改表） ----------
     doc_type: Mapped[str | None] = mapped_column(String(20), nullable=True)

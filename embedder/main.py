@@ -28,15 +28,23 @@ async def main() -> None:
         while True:
             try:
                 r = await client.post("/api/v1/chunks/claim", json={"limit": CLAIM_LIMIT})
-                chunks = r.json()["chunks"]
-                if not chunks:
+                body = r.json()
+                chunks = body["chunks"]
+                # 撤回（阶段 F）：所属版本已作废的块 —— 要把它们的向量从向量库删掉
+                retractions = body.get("retractions", [])
+                if not chunks and not retractions:
                     await asyncio.sleep(IDLE_SLEEP)
                     continue
 
                 for c in chunks:
                     await asyncio.sleep(EMBED_SLEEP)                     # 模拟 embedding 调用
                     await client.post(f"/api/v1/chunks/{c['id']}/complete")
-                logger.info("完成 %d 块", len(chunks))
+
+                for t in retractions:
+                    # 真实实现这里是「向量库 delete(ids=[...])」，删两次也没关系（幂等）
+                    await client.post(f"/api/v1/chunks/{t['id']}/retracted")
+
+                logger.info("完成 %d 块，撤回 %d 块", len(chunks), len(retractions))
             except Exception:
                 logger.exception("认领或上报失败，等一会儿再试")
                 await asyncio.sleep(IDLE_SLEEP)

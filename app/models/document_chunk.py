@@ -39,6 +39,11 @@ class DocumentChunk(Base):
     embedding_status: Mapped[str] = mapped_column(
         String(16), default=EmbeddingStatus.PENDING, index=True, nullable=False
     )
+    # ---------- 更新 / 删除语义（阶段 F）----------
+    # 非 NULL = 所属版本已作废。认领与回收都过滤掉它 —— 不给已作废的块白花 embedding 钱。
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 非 NULL = 下游已确认把该向量从向量库删掉（撤回任务的完成标记）
+    retracted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=utcnow, onupdate=utcnow, nullable=False

@@ -1,14 +1,19 @@
 """
 文档仓储：对 document_clean 的读写集中在这里，只写「查询」，不含业务判断。
+
+阶段 F 起：document_clean **一行 = 一个版本** ，只有 `superseded_at IS NULL` 的那行是当前版本。
+所以所有「面向用户」的查询（列表 / 统计）都必须过滤掉历史版本。
 """
 from datetime import datetime
 
-from sqlalchemy import Select, func, insert, select
+from sqlalchemy import Select, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.document_chunk import DocumentChunk
 from app.models.document_clean import DocumentClean
 from app.models.document_raw import DocumentRaw
+from app.models.document_source import DocumentSource
+from app.utils.time import utcnow
 
 
 class DocumentRepo:
@@ -17,6 +22,8 @@ class DocumentRepo:
 
     @staticmethod
     def _filters(stmt: Select, *, source: str | None, q: str | None) -> Select:
+        # 列表与总数都走这里 —— 历史版本一律不算「文档」
+        stmt = stmt.where(DocumentClean.superseded_at.is_(None))
         if source:
             stmt = stmt.where(DocumentClean.source == source)
         if q:
@@ -61,9 +68,10 @@ class DocumentRepo:
     # ---------- 聚合（阶段 8） ----------
 
     async def count_by_source(self, limit: int = 10) -> list[tuple[str, int]]:
-        """按来源分组取 top N（条数降序）。"""
+        """按来源分组取 top N（条数降序）。只数当前版本。"""
         stmt = (
             select(DocumentClean.source, func.count().label("n"))
+            .where(DocumentClean.superseded_at.is_(None))
             .group_by(DocumentClean.source)
             .order_by(func.count().desc())
             .limit(limit)
@@ -82,7 +90,11 @@ class DocumentRepo:
         stmt = (
             select(func.count())
             .select_from(DocumentClean)
-            .where(DocumentClean.fetched_at >= start, DocumentClean.fetched_at <= end)
+            .where(
+                DocumentClean.fetched_at >= start,
+                DocumentClean.fetched_at <= end,
+                DocumentClean.superseded_at.is_(None),
+            )
         )
         result = await self.db.execute(stmt)
         return int(result.scalar_one())
@@ -92,13 +104,64 @@ class DocumentRepo:
         按 embedding_status 分组计数 —— 就是看板上的「向量化积压」（pending 的那部分）。
 
         一次 GROUP BY 拿全，而不是发三次 COUNT；状态就三种，结果最多三行。
+
+        **必须过滤已作废的块** ：作废时若它还停在 `pending`，这辈子都不会被认领，
+        却会被永远算成「积压」—— 积压数字就再也降不到 0 了。
         """
         stmt = (
             select(DocumentChunk.embedding_status, func.count().label("n"))
+            .where(DocumentChunk.superseded_at.is_(None))
             .group_by(DocumentChunk.embedding_status)
         )
         result = await self.db.execute(stmt)
         return [(row.embedding_status, row.n) for row in result.all()]
+
+    # ---------- 身份（阶段 F）----------
+
+    async def get_source(
+        self, source: str, external_id: str, *, for_update: bool = False
+    ) -> DocumentSource | None:
+        """
+        取身份行。`for_update=True` 加行锁 —— 这是更新语义的 **权威** ：
+        把「读当前版本 → 写新版本」这段串行化。
+
+        Redis 那把身份锁只负责「快速 409」这个体验优化；**真正保证不出现两个 active 版本的，
+        是这把行锁**（尤其 `bulk_ingest` 根本就没拿 Redis 锁）。
+        """
+        stmt = select(DocumentSource).where(
+            DocumentSource.source == source,
+            DocumentSource.external_id == external_id,
+        )
+        if for_update:
+            stmt = stmt.with_for_update()
+        return (await self.db.execute(stmt)).scalar_one_or_none()
+
+    async def insert_source(self, source: str, external_id: str) -> DocumentSource:
+        row = DocumentSource(source=source, external_id=external_id)
+        self.db.add(row)
+        await self.db.flush()        # flush 只为拿自增 id 给 clean.source_id 用，≠ commit
+        return row
+
+    async def get_active_version(self, source_id: int) -> DocumentClean | None:
+        """当前版本 = 该身份下没被作废的那一行。"""
+        stmt = (
+            select(DocumentClean)
+            .where(
+                DocumentClean.source_id == source_id,
+                DocumentClean.superseded_at.is_(None),
+            )
+            .order_by(DocumentClean.id.desc())
+            .limit(1)
+        )
+        return (await self.db.execute(stmt)).scalar_one_or_none()
+
+    async def supersede_version(self, clean_id: int) -> None:
+        """把某个版本标成「已不是当前版本」。不物理删 —— 历史版本留着可按 id 查。"""
+        await self.db.execute(
+            update(DocumentClean)
+            .where(DocumentClean.id == clean_id)
+            .values(superseded_at=utcnow())
+        )
 
     # ---------- 写入（阶段 5） ----------
 
@@ -124,6 +187,9 @@ class DocumentRepo:
         doc_updated_at: datetime | None,
         char_count: int,
         clean_version: int,
+        content_hash: str,
+        source_id: int | None = None,
+        external_id: str | None = None,
         doc_type: str | None = None,
         tags: list[str] | None = None,
         ai_summary: str | None = None,
@@ -131,6 +197,8 @@ class DocumentRepo:
         row = DocumentClean(
             raw_id=raw_id,
             source=source,
+            source_id=source_id,
+            external_id=external_id,
             title=title,
             content=content,
             author=author,
@@ -138,6 +206,7 @@ class DocumentRepo:
             doc_updated_at=doc_updated_at,
             char_count=char_count,
             clean_version=clean_version,
+            content_hash=content_hash,
             doc_type=doc_type,
             tags=tags,
             ai_summary=ai_summary,

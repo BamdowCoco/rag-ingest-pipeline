@@ -22,10 +22,6 @@ class AppError(Exception):
         super().__init__(self.detail)
 
 
-class DuplicateDocumentError(AppError):
-    """文档已存在（判重拒收）"""
-
-
 class DocumentInProgressError(AppError):
     """该文档正在被另一个请求处理，请稍后重试"""
 
@@ -46,7 +42,6 @@ class ChunkNotFoundError(AppError):
 _ERROR_STATUS = {
     DocumentNotFoundError: status.HTTP_404_NOT_FOUND,
     ChunkNotFoundError: status.HTTP_404_NOT_FOUND,
-    DuplicateDocumentError: status.HTTP_409_CONFLICT,
     DocumentInProgressError: status.HTTP_409_CONFLICT,
     EmptyContentError: status.HTTP_422_UNPROCESSABLE_CONTENT,
 }

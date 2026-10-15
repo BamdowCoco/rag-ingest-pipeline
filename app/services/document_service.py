@@ -20,20 +20,28 @@ from app.core.config import settings
 from app.core.exceptions import (
     DocumentInProgressError,
     DocumentNotFoundError,
-    DuplicateDocumentError,
     EmptyContentError,
 )
 from app.models.document_clean import DocumentClean
+from app.repositories.chunk_repo import ChunkRepo
 from app.repositories.document_repo import DocumentRepo
 from app.repositories.dedup_repo import DedupRepo
 from app.schemas.chunk import ChunkOut
-from app.schemas.document import BulkItemResult, BulkResult, DocumentCreate, DocumentOut
+from app.schemas.document import (
+    BulkItemResult,
+    BulkResult,
+    DocumentCreate,
+    DocumentDelete,
+    DocumentOut,
+)
 from app.services.cache_service import (
-    chunk_list_cache_key,
-    document_cache_key,
-    bump_list_version,
+    cache_delete,
     cache_get,
     cache_set,
+    chunk_list_cache_key,
+    document_cache_key,
+    document_version_key,
+    bump_list_version,
     get_list_version,
     list_cache_key,
     stats_cache_key,
@@ -41,16 +49,14 @@ from app.services.cache_service import (
 from app.services.chunk_service import make_chunks
 from app.services.normalize_service import normalize_document
 from app.services.dedup_service import (
-    add_rejected,
     check_and_mark,
-    check_and_mark_bulk,
     get_rejected_count,
     incr_rejected,
     rollback_mark,
 )
 from app.services.enrich_service import enrich
 from app.services.lock_service import LockNotAcquired, document_lock
-from app.utils.time import beijing_today_utc_range
+from app.utils.time import beijing_today_utc_range, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +67,7 @@ class DocumentService:
         self.redis = redis          # 快路径判重、分布式锁、缓存/版本号
         self.repo = DocumentRepo(db)
         self.dedup_repo = DedupRepo(db)
+        self.chunk_repo = ChunkRepo(db)
 
     # ---------- 读 ----------
 
@@ -172,12 +179,25 @@ class DocumentService:
 
     # ---------- 写 ----------
 
-    async def _persist(self, payload: DocumentCreate, raw: dict, cleaned: dict, ai: dict) -> DocumentClean:
+    async def _persist(
+        self,
+        payload: DocumentCreate,
+        raw: dict,
+        cleaned: dict,
+        ai: dict,
+        *,
+        source_id: int,
+        claim_dedup: bool,
+    ) -> DocumentClean:
         """
         三表顺序落库：raw → clean → dedup（顺带切块）， **只 flush、不 commit** 。
 
         单篇与批量都要走这一段，但事务边界各自由调用方决定（批量是每篇一个事务），
         所以提交不放在这里。
+
+        `claim_dedup=True` 才写 `document_dedup` —— 它是 **准入占位** ：
+        只有「新建文档」才认领一份内容；更新 / 复活属于版本操作， **不参与内容准入**
+        （它们的新内容可能正好和别人的一样，那不该卡住自己的更新）。
         """
         # payload 用 mode="json" —— datetime 得变成字符串，JSON 列才存得进去；
         # 而 doc_updated_at 那列要的是真 datetime，所以两个 dump 各取所需
@@ -190,6 +210,9 @@ class DocumentService:
         clean_row = await self.repo.insert_clean(
             raw_id=raw_row.id,
             source=raw["source"],
+            source_id=source_id,
+            external_id=raw.get("external_id"),
+            content_hash=cleaned["content_hash"],
             title=cleaned["title"],
             content=cleaned["content"],
             author=raw.get("author"),
@@ -204,91 +227,249 @@ class DocumentService:
         chunks = make_chunks(cleaned)
         await self.repo.insert_chunks(clean_row.id, chunks)
 
-        await self.dedup_repo.insert_dedup(cleaned["content_hash"], clean_row.id)
-        logger.info("落库完成 doc_id=%s 块数=%d", clean_row.id, len(chunks))
+        if claim_dedup:
+            await self.dedup_repo.insert_dedup(cleaned["content_hash"], clean_row.id)
+        logger.info("落库完成 doc_id=%s 块数=%d 准入认领=%s", clean_row.id, len(chunks), claim_dedup)
         return clean_row
 
     async def _find_existing(self, content_hash: str) -> DocumentClean | None:
-        """按内容指纹回读「已存在」的那篇文档（重复时接口层要把它回给调用方）。"""
+        """按内容指纹回读「已存在」的那篇文档（准入检查命中时要把这篇回给调用方）。"""
         dedup = await self.dedup_repo.get_by_hash(content_hash)
         if dedup is None:
             return None
         return await self.repo.get_by_id(dedup.clean_id)
 
-    async def _require_existing(self, content_hash: str) -> DocumentClean:
-        """
-        回读「已存在」那篇；读不到说明是 **不一致态** （Redis 有占位、库里却没记录），
-        罕见且自愈，仍按 409 处理。
-        """
-        existing = await self._find_existing(content_hash)
-        if existing is None:
-            logger.warning("Redis 有判重占位但库里查不到，属不一致态 hash=%s", content_hash[:12])
-            raise DuplicateDocumentError()
-        return existing
-
     async def ingest(self, payload: DocumentCreate) -> tuple[DocumentClean, bool]:
         """
-        整条管道：标准化 → 加锁 → 判重 → 三表落库 → 提交 → bump 列表版本号。
+        整条管道：标准化 → **快路径** → 加锁 → 身份判断 → 三表落库 → 提交 → bump 列表版本号。
 
-        返回 (文档, 是否新建)。 **【重复不是错误】** —— 同步器周期性重推是正常行为，
-        所以内容已存在时返回【已存在那篇】并置 False，由接口层回 200；
-        只有抢不到锁（同一篇正在被处理）才 409。
+        只有一条路：`external_id` 就是文档身份。
+        - **快路径** （不查库、不抢锁）：命中且内容没变 → 直接回当前版本
+        - **库路径** ：没有身份行 → 过准入检查后新建；有 → 比 hash 决定跳过还是更新
+
+        返回 (文档, 是否新建)，接口层据此回 201 / 200。
         """
         raw = payload.model_dump()
         cleaned = normalize_document(raw)
         content_hash = cleaned["content_hash"]
-        logger.info("ingest 开始 source=%s hash=%s", raw["source"], content_hash[:12])
+        logger.info(
+            "ingest 开始 source=%s ext=%s hash=%s",
+            raw["source"], raw["external_id"], content_hash[:12],
+        )
 
         # 标准化后正文为空 → 拒收。放锁外做，省一次加锁（反正它不涉及竞态）。
         if not cleaned["content"]:
             logger.info("拒收：标准化后正文为空 hash=%s", content_hash[:12])
             raise EmptyContentError()
 
-        try:
-            # ---------- 临界区：只有「判重 → 落库」需要互斥 ----------
-            # 锁按 content_hash 粒度：不同文档互不阻塞，同一篇才串行
-            async with document_lock(self.redis, content_hash):
-                # ① 快路径：Redis 原子判重。命中不是错误 → 回已存在那篇
-                if not await check_and_mark(self.redis, content_hash):
-                    await incr_rejected(self.redis)          # 统计「挡掉了多少重复同步」
-                    logger.info("判重（Redis 快路径）→ 已存在 hash=%s", content_hash[:12])
-                    return await self._require_existing(content_hash), False
+        # ---- 快路径：最常见的那路流量（重推一篇没变的文档），不查库、不抢锁 ----
+        fast = await self._fast_skip(raw, cleaned)
+        if fast is not None:
+            return fast, False
 
-                try:
-                    # ---- AI 接缝：判重之后、落库之前 ----
-                    # enrich 内部已兜住所有异常，失败返回三列 None，不会阻断入库
-                    ai = await enrich(cleaned)
-                    clean_row = await self._persist(payload, raw, cleaned, ai)
-                    # 一次 commit 落定整笔
-                    await self.db.commit()
-                except IntegrityError:
-                    # 权威兜底：Redis 被清空，或锁 TTL 已过、有别人冲进来 → 唯一索引拦下。
-                    # 【必须 rollback】：不回滚，session 就废了，后续任何操作都会报错。
-                    await self.db.rollback()
-                    await rollback_mark(self.redis, content_hash)   # 撤掉快路径的错误占位
-                    await incr_rejected(self.redis)                 # 唯一索引拦下的也算拒收
-                    logger.info("判重（唯一索引兜底）→ 已存在 hash=%s", content_hash[:12])
-                    return await self._require_existing(content_hash), False
+        lock_id = self._identity_lock_id(raw["source"], raw["external_id"])
+        try:
+            async with document_lock(self.redis, lock_id):
+                clean_row, created, changed = await self._apply_identified(payload, raw, cleaned)
         except LockNotAcquired:
-            # 已有别的请求在跑同一篇：报 409，让调用方稍后重试
-            logger.info("未拿到锁（同篇正在处理）hash=%s", content_hash[:12])
+            logger.info("未拿到锁（同身份正在处理）ext=%s", raw["external_id"])
             raise DocumentInProgressError() from None
 
-        # 有新数据了：版本号 +1，所有旧列表缓存瞬间失效
-        # （单条缓存不用管：文档写入后不会改，TTL 自然过期即可）
+        if changed:
+            await bump_list_version(self.redis)
+        return clean_row, created
+
+    async def _fast_skip(self, raw: dict, cleaned: dict) -> DocumentClean | None:
+        """
+        身份版本快路径：缓存命中且内容没变 → 直接回【当前版本】。
+
+        **它挡的是最常见的流量** ：同步器周期性重推一篇没变的文档。
+        没这一步，每次重推都要 `SELECT ... FOR UPDATE` 去抢一次行锁 —— 又慢、又互相排队。
+        缓存里存 `{clean_id, content_hash}`：光有 hash 不够，还得有 id 才能取出文档本体回给调用方。
+
+        **失败模式** ：这份缓存错了是 **「漏一次更新」** （把新内容当成没变），
+        不是去重 SET 那种「多拒一次」—— 严重性不同，所以它 write-through + TTL 兜底。
+        读不到实体行（缓存与库不同步）时 **老实回落** 到库路径，不硬信缓存。
+        """
+        cached = await cache_get(
+            self.redis, document_version_key(raw["source"], raw["external_id"])
+        )
+        if not cached or cached.get("content_hash") != cleaned["content_hash"]:
+            return None
+
+        row = await self.repo.get_by_id(cached["clean_id"])
+        if row is None:                      # 不一致态 → 回落，别撒谎
+            return None
+
+        await incr_rejected(self.redis)      # 它确实挡掉了一次重复同步
+        logger.info("快路径命中 → 内容未变 ext=%s", raw["external_id"])
+        return row
+
+    async def _remember_version(
+        self, source: str, external_id: str, clean_row: DocumentClean
+    ) -> None:
+        """
+        write-through： **DB 提交成功之后** 才写快路径。
+        顺序反了就会缓存住一个根本没落库的版本 —— 那是"漏更新"，很难查。
+        """
+        await cache_set(
+            self.redis,
+            document_version_key(source, external_id),
+            {"clean_id": clean_row.id, "content_hash": clean_row.content_hash},
+            ttl=settings.cache_ttl,
+        )
+
+    # ---------- 写：身份路径（阶段 F）----------
+
+    @staticmethod
+    def _identity_lock_id(source: str, external_id: str) -> str:
+        """
+        身份锁的 ID。 **必须按身份锁、不能按内容锁** ——
+        同一篇文档"改了内容"前后是两个不同的 hash，按 hash 锁等于各拿各的锁，根本拦不住。
+        """
+        return f"src:{source}:{external_id}"
+
+    async def _apply_identified(
+        self, payload: DocumentCreate, raw: dict, cleaned: dict
+    ) -> tuple[DocumentClean, bool, bool]:
+        """
+        身份路径的核心： **一个事务里「读身份 → 决定 → 写」** 。
+        返回 (文档, 是否新建, active 集合有没有变动)。
+
+        并发上分三层（形状与既有的「双层去重」一致）：
+        - 快路径：Redis 身份锁（把并发同篇变成 **快速 409** ）
+        - **权威** ：下面这把 `SELECT ... FOR UPDATE` **行锁** —— 真正串行化更新；
+          `bulk_ingest` 没有 Redis 锁，就全靠它
+        - 兜底：`UNIQUE(source, external_id)` —— 并发 **创建** 同一身份时拦下
+
+        **调用方负责拿锁** （单篇拿 Redis 锁；批量有意不拿，省往返）。
+        """
+        source, external_id = raw["source"], raw["external_id"]
+        content_hash = cleaned["content_hash"]
+        claimed = False          # 这次有没有占住「内容准入」的位（决定失败时要不要撤）
+
+        try:
+            src = await self.repo.get_source(source, external_id, for_update=True)
+            current = None
+            if src is None:
+                # ---- 准入检查：这是「新文档进门」，先问「这份内容是不是已经属于别人了」----
+                # 只在身份行都不存在时做 —— 更新 / 复活是版本操作、不参与内容准入
+                # （它们的新内容可能正好与别人的一样，那不该卡住自己的更新）。
+                claimed = await check_and_mark(self.redis, content_hash)
+                if not claimed:
+                    existing = await self._find_existing(content_hash)
+                    if existing is not None:
+                        # 同前：用 commit 收尾而不是 rollback —— 本事务只读过，
+                        # 而 rollback 会把已加载对象的属性全部过期，之后 FastAPI
+                        # 在同步上下文里取属性就 MissingGreenlet。
+                        await self.db.commit()
+                        await incr_rejected(self.redis)
+                        logger.info("准入检查 → 内容已属于别人 hash=%s", content_hash[:12])
+                        return existing, False, False
+                    # Redis 说"见过"、库里却没有 → 不一致态（罕见且自愈），继续按新建走。
+                    # 注意这里 claimed 仍是 False：没占位，失败时也不该去 SREM。
+                src = await self.repo.insert_source(source, external_id)
+                created, changed = True, True
+            else:
+                current = await self.repo.get_active_version(src.id)
+                if current is not None and current.content_hash == content_hash:
+                    # 内容没变 —— 不是错误，回【当前那一版】
+                    # 用 commit 而不是 rollback 收尾：本事务只有一次 SELECT ... FOR UPDATE（没写过东西），
+                    # 而 rollback 会把已加载对象的属性全部过期 —— 之后 FastAPI 在同步上下文里
+                    # 取属性就会 MissingGreenlet。commit 同样释放行锁，且 expire_on_commit=False 让属性留着。
+                    await self.db.commit()
+                    await incr_rejected(self.redis)      # 它确实挡掉了一次重复同步
+                    logger.info("身份判重 → 内容未变 ext=%s", external_id)
+                    return current, False, False
+                created, changed = False, True
+                if src.deleted_at is not None:
+                    # 源系统删过、又推回来了 → 复活
+                    src.deleted_at = None
+                    logger.info("身份复活 ext=%s", external_id)
+
+            # ---- AI 接缝：判定之后、落库之前 ----
+            ai = await enrich(cleaned)
+            clean_row = await self._persist(
+                payload, raw, cleaned, ai, source_id=src.id, claim_dedup=claimed
+            )
+
+            if current is not None:
+                # 作废旧版本；它的块一并作废。
+                # 撤回任务不用在这里创建 —— claim_retractions 按「已 done 且未 retracted」自己筛。
+                await self.repo.supersede_version(current.id)
+                await self.chunk_repo.supersede_by_document(current.id)
+
+            await self.db.commit()
+        except IntegrityError:
+            # 【必须 rollback】：不回滚，session 就废了，后续任何操作都会报错。
+            await self.db.rollback()
+            if claimed:
+                await rollback_mark(self.redis, content_hash)   # 撤掉准入占位
+                existing = await self._find_existing(content_hash)
+                if existing is not None:
+                    await incr_rejected(self.redis)
+                    logger.info("准入检查（唯一索引兜底）→ 内容已属于别人 hash=%s", content_hash[:12])
+                    return existing, False, False
+            # 否则是并发创建同一身份 → 唯一约束拦下。报 409，让同步器下一轮重推。
+            logger.warning("身份并发创建冲突 ext=%s", external_id)
+            raise DocumentInProgressError() from None
+
+        await self._remember_version(source, external_id, clean_row)   # write-through 快路径
+        logger.info(
+            "%s 身份路径 ext=%s clean_id=%s",
+            "新增" if created else "更新", external_id, clean_row.id,
+        )
+        return clean_row, created, changed
+
+    async def delete_document(self, payload: DocumentDelete) -> bool:
+        """
+        删除信号（ **幂等** ，返回本次是否真的删掉了）。
+
+        和更新一样 **必须拿同一把身份锁** —— 否则会和 ingest 交错出
+        「active 版本还在、`deleted_at` 却已置上」，那条「deleted ⇒ 没有 active 版本」
+        的不变式就破了（读路径靠它才不用 join 到 document_source）。
+
+        一个事务里：作废 active 版本 + 它的块 → 置 `deleted_at` → bump 列表版本号。
+        """
+        lock_id = self._identity_lock_id(payload.source, payload.external_id)
+        try:
+            async with document_lock(self.redis, lock_id):
+                src = await self.repo.get_source(
+                    payload.source, payload.external_id, for_update=True
+                )
+                if src is None or src.deleted_at is not None:
+                    await self.db.rollback()        # 没这个身份 / 已经删过 → 幂等返回
+                    return False
+
+                current = await self.repo.get_active_version(src.id)
+                src.deleted_at = utcnow()
+                if current is not None:
+                    await self.repo.supersede_version(current.id)
+                    await self.chunk_repo.supersede_by_document(current.id)
+                await self.db.commit()
+        except LockNotAcquired:
+            logger.info("未拿到锁（同身份正在处理）ext=%s", payload.external_id)
+            raise DocumentInProgressError() from None
+
+        # 必须把快路径也清掉：否则下次推同样的内容会命中缓存，把"已删除的版本"直接回给调用方
+        await cache_delete(
+            self.redis, document_version_key(payload.source, payload.external_id)
+        )
         await bump_list_version(self.redis)
-        logger.info("ingest 成功 hash=%s clean_id=%s", content_hash[:12], clean_row.id)
-        return clean_row, True
+        logger.info("文档已删除 source=%s ext=%s", payload.source, payload.external_id)
+        return True
 
     async def bulk_ingest(self, payloads: list[DocumentCreate]) -> BulkResult:
         """
-        批量摄入（同步器的真实调用方式）。与单篇有三点不同，都是为了「一次推很多篇」：
+        批量摄入（同步器的真实调用方式）。 **与单篇走同一条路** ，只是不拿 Redis 锁：
 
-        1. **判重走 pipeline** ：N 次 SADD 压成 **一次往返** （单篇那套是每篇一次）
-        2. **不加分布式锁** ：一次加锁 ≈ 2 次往返/篇，逐篇加锁会把 pipeline 省下的
-           往返又加回去；而 pipeline 的 SADD **本身就是原子的预留** （只有一个人拿到
-           1），唯一索引仍是最终兜底
+        1. 每篇先过 **身份版本快路径** —— 重推没变的文档在这一步就被挡掉，不查库、不加锁
+        2. 剩下的逐篇走 `_apply_identified`， **不加分布式锁** ：
+           一次加锁 ≈ 2 次往返/篇，会把快路径省下的又加回去；
+           正确性交给 `document_source` 那一行的 **行锁 + 唯一约束**
         3. 重复 **按条跳过** 、不报错：同步器周期重推是正常行为
+
+        按 **下标** 把结果填回同一个 `items`，所以出参顺序与请求一致。
         """
         total = len(payloads)
         items: list[BulkItemResult | None] = [None] * total
@@ -305,60 +486,48 @@ class DocumentService:
                 continue
             prepared.append((i, payload, raw, cleaned))
 
-        # ② 一次 pipeline 预留所有 hash —— N 次往返压成 1 次（本段的核心演示点）
-        flags = await check_and_mark_bulk(
-            self.redis, [c["content_hash"] for _, _, _, c in prepared]
-        )
+        created = updated = duplicates = 0
 
-        created = duplicates = 0
-        # TODO: zip 把多个可迭代对象"按位置配对"，每次循环各取一个
-        for (i, payload, raw, cleaned), is_new in zip(prepared, flags):
-            content_hash = cleaned["content_hash"]
-
-            # ③ pipeline 说「已有」→ 直接跳过，【连数据库都不碰】
-            #    （省下的就是这一趟往返 + 后续重新切块、向量化的钱）
-            if not is_new:
+        for i, payload, raw, cleaned in prepared:
+            # ② 快路径：重推没变的文档在这一步就打住（0 次查库、0 次加锁）
+            fast = await self._fast_skip(raw, cleaned)
+            if fast is not None:
                 duplicates += 1
-                existing = await self._find_existing(content_hash)
-                items[i] = BulkItemResult(
-                    index=i, status="duplicate", id=existing.id if existing else None
-                )
+                items[i] = BulkItemResult(index=i, status="duplicate", id=fast.id)
                 continue
 
+            # ③ 库路径：逐篇走身份判断（不加 Redis 锁 —— 权威是那把行锁 + 唯一约束）
             try:
-                ai = await enrich(cleaned)
-                clean_row = await self._persist(payload, raw, cleaned, ai)
-                await self.db.commit()                        # 每篇一个事务
-            except IntegrityError:
-                # 权威兜底：Redis 被清空 → 唯一索引拦下
-                await self.db.rollback()
-                await rollback_mark(self.redis, content_hash)
-                duplicates += 1
-                existing = await self._find_existing(content_hash)
-                items[i] = BulkItemResult(
-                    index=i, status="duplicate", id=existing.id if existing else None
+                clean_row, was_created, changed = await self._apply_identified(
+                    payload, raw, cleaned
                 )
             except Exception:
-                # 其它任何失败也必须撤掉占位：这个 hash 是本批【预先预留】的，
-                # 不 SREM 就会永久留在 Set 里、从此把这篇文档误判成重复
-                # —— 这是「先预留、后落库」独有的坑。
                 await self.db.rollback()
-                await rollback_mark(self.redis, content_hash)
-                logger.exception("批量落库失败 index=%d hash=%s", i, content_hash[:12])
+                logger.exception("批量落库失败 index=%d ext=%s", i, raw.get("external_id"))
                 items[i] = BulkItemResult(index=i, status="rejected")
-            else:
+                continue
+
+            if not changed:
+                duplicates += 1
+                items[i] = BulkItemResult(index=i, status="duplicate", id=clean_row.id)
+            elif was_created:
                 created += 1
                 items[i] = BulkItemResult(index=i, status="created", id=clean_row.id)
+            else:
+                updated += 1
+                items[i] = BulkItemResult(index=i, status="updated", id=clean_row.id)
 
-        if duplicates:
-            await add_rejected(self.redis, duplicates)         # 一次性 +n，而不是 N 次 incr
-        if created:
+        if created or updated:
             await bump_list_version(self.redis)
-        logger.info("bulk_ingest 完成 收到=%d 新建=%d 重复=%d", total, created, duplicates)
+        logger.info(
+            "bulk_ingest 完成 收到=%d 新建=%d 更新=%d 重复=%d",
+            total, created, updated, duplicates,
+        )
         return BulkResult(
             received=total,
             created=created,
+            updated=updated,
             duplicates=duplicates,
-            rejected=total - created - duplicates,
+            rejected=total - created - updated - duplicates,
             items=[it for it in items if it is not None],
         )

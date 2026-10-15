@@ -26,6 +26,10 @@ async def cache_set(redis: Redis, key: str, value: Any, ttl: int) -> None:
     await redis.set(key, json.dumps(value, ensure_ascii=False, default=str), ex=ttl)
 
 
+async def cache_delete(redis: Redis, key: str) -> None:
+    await redis.delete(key)
+
+
 async def get_list_version(redis: Redis) -> int:
     """列表缓存的当前版本号；键不存在时按 0 处理（于是键为 v0）。"""
     v = await redis.get(_LIST_VERSION_KEY)
@@ -65,3 +69,20 @@ def chunk_list_cache_key(document_id: int, *, page: int, limit: int) -> str:
     TTL 自然过期就够了。这正是「失效策略取决于数据可变性」的正面例子。
     """
     return f"document:{document_id}:chunks:{page}:{limit}"
+
+
+def document_version_key(source: str, external_id: str) -> str:
+    """
+    「身份 → 当前版本」的快路径键（阶段 F）。
+
+    存 `{"clean_id": N, "content_hash": "..."}` —— 光有 hash 不够，还得有 id 才能把
+    文档本体取出来回给调用方（所以别只存 hash）。
+
+    它挡的是 **最常见的那一路流量** ：同步器重推一篇没变的文档。命中就直接回 200，
+    既不用查库，也不用去抢那把 `SELECT ... FOR UPDATE` 行锁。
+
+    **失败模式要说清楚** ：这份缓存错了是 **「漏一次更新」** （重推的新内容被当成没变），
+    不是去重 SET 那种「多拒一次」。所以它必须 **write-through** （DB 提交成功后才写），
+    并且靠 TTL 兜底 —— Redis 被清空时未命中，落到库路径，结论仍然正确。
+    """
+    return f"docver:{source}:{external_id}"

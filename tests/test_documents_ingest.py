@@ -43,3 +43,14 @@ async def test_empty_after_normalize_is_422(client, make_doc):
 async def test_missing_required_field_is_422(client):
     r = await client.post("/api/v1/documents", json={"source": "feishu", "title": "缺正文"})
     assert r.status_code == 422
+
+
+async def test_external_id_is_required(client, make_doc):
+    """
+    阶段 F 起 `external_id` **必填** —— 它就是「文档身份」。
+    没有它，系统分不清「同一篇改过了」和「这是新的一篇」。
+    """
+    doc = make_doc()
+    doc.pop("external_id")
+    r = await client.post("/api/v1/documents", json=doc)
+    assert r.status_code == 422

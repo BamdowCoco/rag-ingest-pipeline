@@ -27,8 +27,19 @@ from app.db.session import engine
 from app.infra.redis_client import redis_client
 from app.main import app
 
-# 清库顺序无所谓（会临时关掉外键检查），但列全了才不会漏表
-_TABLES = ("document_chunk", "document_dedup", "document_clean", "document_raw")
+# 清库顺序无所谓（会临时关掉外键检查），但列全了才不会漏表。
+# 阶段 F 加了 document_source（身份表）—— 漏了它，身份行会跨测试残留，
+# 于是下一个测试用同一个 external_id 时会被当成"更新"而不是"新增"。
+_TABLES = (
+    "document_chunk",
+    "document_dedup",
+    "document_clean",
+    "document_raw",
+    "document_source",
+)
+
+# 模块级计数器：`make_doc` 用它发唯一 external_id，跨测试也不会重复
+_doc_counter = itertools.count()
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -42,13 +53,17 @@ async def prepare_database():
     root_pw = os.getenv("DB_ROOT_PASSWORD", "")
     root_url = f"mysql+aiomysql://root:{root_pw}@{settings.db_host}:{settings.db_port}/"
     db = settings.db_name
+    # 先断开 app 自己的引擎（它指向测试库）—— 否则它占着的连接会挡住下面的 DROP
+    await engine.dispose()
+
     root_engine = create_async_engine(root_url, pool_pre_ping=True)
     async with root_engine.begin() as conn:
+        # 【DROP 而不是 IF NOT EXISTS】本仓没有 Alembic，而 `create_all` 只建缺的表、
+        # 不会给已有表加列 —— 留着上一版 schema 的库会直接报 `Unknown column`。
+        # 测试库本来就是一次性的，干脆每次从零开始建。
+        await conn.execute(text(f"DROP DATABASE IF EXISTS `{db}`"))
         await conn.execute(
-            text(
-                f"CREATE DATABASE IF NOT EXISTS `{db}` "
-                "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
-            )
+            text(f"CREATE DATABASE `{db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
         )
         await conn.execute(text(f"GRANT ALL ON `{db}`.* TO '{settings.db_user}'@'%'"))
         await conn.execute(text("FLUSH PRIVILEGES"))
@@ -103,13 +118,19 @@ def redis():
 
 @pytest.fixture
 def make_doc():
-    """造一篇 **内容唯一** 的文档：内容不同 → hash 不同，测试内部不会互相判重。"""
-    counter = itertools.count()
+    """
+    造一篇 **内容唯一** 的文档。
+
+    默认带一个 **唯一的 `external_id`** —— 阶段 F 之后它是必填的，而且 **身份** 才是判「同一篇」的依据。
+    计数器放在 **模块级** ：这样一个会话里绝不会重复用到同一个 id（跨测试文件的重复尤其坑）。
+    想让两篇文档"是同一篇"，就显式传同一个 `external_id`。
+    """
 
     def _make(**overrides) -> dict:
-        n = next(counter)
+        n = next(_doc_counter)
         doc = {
             "source": "feishu",
+            "external_id": f"ext-{n}",
             "title": f"标题-{n}",
             "content": f"这是第 {n} 篇的正文内容。",
         }

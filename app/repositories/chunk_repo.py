@@ -31,7 +31,11 @@ class ChunkRepo:
         """
         stmt = (
             select(DocumentChunk)
-            .where(DocumentChunk.embedding_status == EmbeddingStatus.PENDING)
+            .where(
+                DocumentChunk.embedding_status == EmbeddingStatus.PENDING,
+                # 排除已作废的块 —— 所属版本已经不是当前版本了，再向量化就是白花钱
+                DocumentChunk.superseded_at.is_(None),
+            )
             .order_by(DocumentChunk.id)          # 稳定的顺序，避免长期饿死某些行
             .limit(limit)
             .with_for_update(skip_locked=True)
@@ -56,6 +60,8 @@ class ChunkRepo:
             .where(
                 DocumentChunk.embedding_status == EmbeddingStatus.PROCESSING,
                 DocumentChunk.updated_at < older_than,
+                # 已作废的不必再放回 pending —— 反正 claim_pending 也不认领它
+                DocumentChunk.superseded_at.is_(None),
             )
             .values(embedding_status=EmbeddingStatus.PENDING, updated_at=utcnow())
         )
@@ -69,6 +75,61 @@ class ChunkRepo:
             update(DocumentChunk)
             .where(DocumentChunk.id == chunk_id)
             .values(embedding_status=EmbeddingStatus.DONE, updated_at=utcnow())
+        )
+        result = await self.db.execute(stmt)
+        await self.db.commit()
+        return (result.rowcount or 0) > 0
+
+    # ---------- 更新 / 删除语义（阶段 F）----------
+
+    async def supersede_by_document(self, document_id: int) -> int:
+        """
+        作废某个版本的全部块，返回条数。
+
+        故意 **不动 `retracted_at`** —— 哪些块需要下游撤回，交给 `claim_retractions`
+        按「已 done 且未 retracted」自己筛。于是「作废时还停在 pending 的块不用撤回」
+        （下游从没见过它）这件事 **自动成立** ，不用在这里特判。
+        """
+        stmt = (
+            update(DocumentChunk)
+            .where(
+                DocumentChunk.document_id == document_id,
+                DocumentChunk.superseded_at.is_(None),
+            )
+            .values(superseded_at=utcnow())
+        )
+        result = await self.db.execute(stmt)
+        return result.rowcount or 0
+
+    async def claim_retractions(self, limit: int) -> list[DocumentChunk]:
+        """
+        认领一批「要下游把向量删掉」的块。
+
+        **它和补齐流不一样：这里没有 in-flight 状态。** 因为删向量是 **幂等** 的
+        （同一个向量删两次没差别），所以允许多个 worker 拿到同一批、下游重复删 ——
+        换来的是「worker 崩了任务也不会静默丢失，下一轮自然重试」。
+        也就是说它 **不共享** `SKIP LOCKED` 的「各拿一批」语义，这是刻意的取舍。
+
+        只在 **已 done** 的块上产生任务：没被认领过的 pending 块压根没向量可删。
+        """
+        stmt = (
+            select(DocumentChunk)
+            .where(
+                DocumentChunk.superseded_at.is_not(None),
+                DocumentChunk.retracted_at.is_(None),
+                DocumentChunk.embedding_status == EmbeddingStatus.DONE,
+            )
+            .order_by(DocumentChunk.id)
+            .limit(limit)
+        )
+        return list((await self.db.execute(stmt)).scalars().all())
+
+    async def mark_retracted(self, chunk_id: int) -> bool:
+        """下游确认「该向量已删」。返回 False 表示没这个 id、或已经确认过了。"""
+        stmt = (
+            update(DocumentChunk)
+            .where(DocumentChunk.id == chunk_id, DocumentChunk.retracted_at.is_(None))
+            .values(retracted_at=utcnow())
         )
         result = await self.db.execute(stmt)
         await self.db.commit()

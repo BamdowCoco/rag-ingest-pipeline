@@ -36,6 +36,18 @@ class TaskService:
         logger.info("认领 %d 个待向量化 chunk", len(rows))
         return rows
 
+    async def claim_retractions(self, limit: int) -> list[DocumentChunk]:
+        """
+        认领一批「要下游把向量删掉」的块。
+
+        注意它和 `claim` **不是一回事** ：撤回没有 in-flight 状态，多个 worker 可能拿到同一批
+        （删向量是幂等的）—— 详细取舍见 `chunk_repo.claim_retractions`。
+        """
+        rows = await self.repo.claim_retractions(limit)
+        if rows:
+            logger.info("认领 %d 个待撤回 chunk（所属版本已作废）", len(rows))
+        return rows
+
     async def complete(self, chunk_id: int) -> DocumentChunk:
         """回报某个 chunk 已完成。id 不存在 → 404。"""
         if not await self.repo.mark_done(chunk_id):
@@ -48,4 +60,20 @@ class TaskService:
         self.db.expire_all()
         obj = await self.db.get(DocumentChunk, chunk_id)
         assert obj is not None                      # 刚刚 update 成功过，必然存在
+        return obj
+
+    async def retract(self, chunk_id: int) -> DocumentChunk:
+        """
+        回报「该向量已从向量库删掉」。id 不存在、或已经确认过 → 404。
+
+        `mark_done` 那条注释同样适用：Core update() 绕过 ORM，取之前要先 `expire_all()`。
+        """
+        if not await self.repo.mark_retracted(chunk_id):
+            logger.info("回报撤回失败：chunk 不存在或已确认过 id=%s", chunk_id)
+            raise ChunkNotFoundError()
+        logger.info("chunk %s 的向量已撤回", chunk_id)
+
+        self.db.expire_all()
+        obj = await self.db.get(DocumentChunk, chunk_id)
+        assert obj is not None
         return obj
