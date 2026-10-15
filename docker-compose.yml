@@ -1,5 +1,6 @@
-# 定义多容器 Docker 应用：api + mysql + redis
-# 用法：docker compose up -d  →  docker compose ps（三个都 healthy）→  http://localhost:8000/docs
+# 定义多容器 Docker 应用：api + mysql + redis + syncer + embedder
+# 用法：docker compose up -d  →  docker compose ps（基础三个 healthy）→  http://localhost:8000/docs
+#      再看完整流水线：docker compose up -d --scale syncer=2 --scale embedder=3
 #
 # 端口：容器内 mysql/redis 是 3306/6379，映射到宿主机 3307/6380，避开本机可能已在跑的实例
 services:
@@ -33,6 +34,32 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    restart: unless-stopped
+    networks: [backend]
+
+  # ---------- 同步器：周期性批量推文档（可 --scale 起多实例）----------
+  syncer:
+    build: ./syncer
+    # 【不设 container_name / ports】—— 设了就没法 --scale（名字/端口会撞车）
+    environment:
+      API_BASE: "http://api:8000"     # 容器内用服务名连 api
+      SYNC_INTERVAL: "5"              # 每 5 秒推一批
+    depends_on:
+      api:
+        condition: service_healthy   # 等 api 健康再开始推
+    restart: unless-stopped
+    networks: [backend]
+
+  # ---------- 向量化 worker：认领 chunk → 模拟 embedding → 上报完成（可 --scale）----------
+  embedder:
+    build: ./embedder
+    environment:
+      API_BASE: "http://api:8000"
+      CLAIM_LIMIT: "20"               # 每次认领多少块
+      EMBED_SLEEP: "0.05"             # 模拟单块 embedding 的耗时（秒）
+    depends_on:
+      api:
+        condition: service_healthy
     restart: unless-stopped
     networks: [backend]
 

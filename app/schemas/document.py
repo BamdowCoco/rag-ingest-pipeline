@@ -1,5 +1,6 @@
 """文档出入参。"""
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -30,3 +31,24 @@ class DocumentOut(BaseModel):
     doc_type: str | None = None
     tags: list[str] | None = None
     ai_summary: str | None = None
+
+
+class BulkDocumentCreate(BaseModel):
+    """POST /documents/bulk 的入参 —— 同步器的真实调用方式，一次最多 200 篇。"""
+    documents: list[DocumentCreate] = Field(..., min_length=1, max_length=200)
+
+
+class BulkItemResult(BaseModel):
+    """批量提交里【单篇】的结果。"""
+    index: int                                        # 在请求里的位置
+    status: Literal["created", "duplicate", "rejected"]
+    id: int | None = None                             # created = 新建的 id；duplicate = 已存在那篇的 id
+
+
+class BulkResult(BaseModel):
+    """批量提交的汇总结果。重复【不是错误】，按条跳过 —— 见 README「为什么重复不是错误」。"""
+    received: int
+    created: int
+    duplicates: int
+    rejected: int                                     # 空正文，或落库失败
+    items: list[BulkItemResult]

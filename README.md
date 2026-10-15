@@ -56,7 +56,27 @@ content_hash = sha256(title + "\n" + cleaned_content)
 
 **这里去重省下的不只是数据库往返，还有下游的 embedding 费用**——所以它值得做两层。
 
-### 3. 按内容哈希粒度的分布式锁
+### 3. 批量摄入：把 N 次判重往返压成 1 次（pipeline）
+
+同步器一次推几百篇（`POST /documents/bulk`），**逐条**判重就是几百次 Redis 往返。
+`bulk_ingest` 用 `pipeline` 把这些 `SADD` **一次发出去**：
+
+```python
+pipe = redis.pipeline()
+for h in hashes:
+    pipe.sadd("dedup:documents", h)     # 每条 SADD 各自返回 1 / 0
+flags = await pipe.execute()            # ← 一次往返，拿到逐条的「是否新增」
+```
+
+**N 次往返 → 1 次**。而且每条 `SADD` 仍然是**原子的**——pipeline 只是把命令打包发送，
+并没有把多条命令合成一个非原子操作，所以不存在 `SISMEMBER` + `SADD` 那种两步竞态。
+
+> **批量里为什么反而【不】加分布式锁？** 一次加锁 ≈ 2 次往返/篇（`SET NX PX` + Lua 释放），
+> 逐篇加锁会把 pipeline 省下的往返**又加回去**。而 `SADD` 本身就是一次**原子的预留**
+> （只有一个人拿到 1），唯一索引仍是最终兜底——锁在这里只剩代价、没有收益。
+> 单篇则相反：锁能把「并发同篇」从一次数据库往返 + 异常，变成一次**快速失败**，划算。
+
+### 4. 按内容哈希粒度的分布式锁
 
 同步洪峰下**多个同步器会同时推同一份文档**（飞书 + Confluence 同时同步）。锁把「判重 → 落库」这段临界区串行化。
 
@@ -64,7 +84,7 @@ content_hash = sha256(title + "\n" + cleaned_content)
 - 释放用 **Lua 原子比对 token**：裸 `DEL` 可能在锁过期后**删掉别人的锁**
 - TTL 自动过期是**崩溃安全**的代价：持有者挂了锁最终会自己释放
 
-### 4. 切块（chunking）
+### 5. 切块（chunking）
 
 不是"每 500 字切一刀"。真实做法有两条讲究：
 
@@ -73,7 +93,7 @@ content_hash = sha256(title + "\n" + cleaned_content)
 
 每个 chunk 记 `token_count` 与 `embedding_status`，成为下游可消费的**任务单元**。
 
-### 5. 异步：用 `SKIP LOCKED` 做极简任务队列
+### 6. 异步：用 `SKIP LOCKED` 做极简任务队列
 
 切块是 CPU 活，**向量化是一次秒级的外部 API 调用**——一次同步几千篇，**同步等就是不可行的**。所以：
 
@@ -88,14 +108,14 @@ content_hash = sha256(title + "\n" + cleaned_content)
 
   > **锁**是「这件事只能一个人做」（保护临界区）；**`SKIP LOCKED`** 是「这堆活大家分着做」（分发任务）。同一个项目里两种并发原语，各有各的位置。
 
-### 6. Cache-Aside + 版本号失效
+### 7. Cache-Aside + 版本号失效
 
 - **列表 / 统计**：键里带 `v{version}`，写入时 `INCR documents:list:version` → 旧键**瞬间不可达**（O(1)，不用 `SCAN`）
 - **文档详情 / 分块列表**：**一次写入、永不修改** → 用**纯 TTL** 即可，不需要写时失效
 
 > 「失效策略取决于**数据可变性**」——这里文档与 chunk 都不可变，所以纯 TTL 是正确答案，一行失效逻辑都不用写。
 
-### 7. AI 接缝（已留好，未接模型）
+### 8. AI 接缝（已留好，未接模型）
 
 `enrich()` 插在**去重之后、落库之前**，给文档补 `doc_type`（手册/纪要/规范）、`tags`、`ai_summary`（检索结果展示用）。铁律：**AI 是可选增强，失败绝不阻断入库**——出错就留 NULL。
 
@@ -233,10 +253,10 @@ docker compose exec -T mysql mysql -uroot -proot123456 -e "
 
 改造分 5 段，每段独立可验证、可叫停（详见 [`docs/改造路线.md`](docs/改造路线.md)）：
 
-- [ ] **A** 全量换皮改名：article 域 → document 域（表 / 模型 / 服务 / 接口 / Redis 键）
-- [ ] **B** 切块：新增 `document_chunk` 表 + 切块服务（段落优先 + overlap），管道接上切块
-- [ ] **C** 异步任务分发：`/chunks/claim` + `/complete`（`SKIP LOCKED`），worker 可并发认领
-- [ ] **D** 批量摄入 + 同步器 + worker 容器（`syncer` / `embedder`，可 `--scale`）
+- [x] **A** 全量换皮改名：article 域 → document 域（表 / 模型 / 服务 / 接口 / Redis 键）
+- [x] **B** 切块：新增 `document_chunk` 表 + 切块服务（段落优先 + overlap），管道接上切块
+- [x] **C** 异步任务分发：`/chunks/claim` + `/complete`（`SKIP LOCKED`），worker 可并发认领
+- [x] **D** 批量摄入 + 同步器 + worker 容器（`syncer` / `embedder`，可 `--scale`）
 - [ ] **E** 叙事重写（README + 架构说明）
 
 ---

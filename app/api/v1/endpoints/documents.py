@@ -2,12 +2,13 @@
 文档接口。
 
 GET 列表 / GET 单篇走 Cache-Aside（阶段 7）；POST 走完整管道（标准化→加锁→判重→入库）。
+阶段 D：新增 POST /bulk 批量入口；单篇重复从 409 改为 200（「重复不是错误」）。
 """
-from fastapi import APIRouter, Depends, Path, Query, status
+from fastapi import APIRouter, Depends, Path, Query, Response, status
 
 from app.api.deps import get_document_service
 from app.schemas.chunk import ChunkOut
-from app.schemas.document import DocumentCreate, DocumentOut
+from app.schemas.document import BulkDocumentCreate, BulkResult, DocumentCreate, DocumentOut
 from app.schemas.common import Page
 from app.services.document_service import DocumentService
 
@@ -29,9 +30,23 @@ async def list_documents(
 @router.post("", status_code=status.HTTP_201_CREATED, response_model=DocumentOut, summary="提交文档")
 async def create_document(
     payload: DocumentCreate,
+    response: Response,
     service: DocumentService = Depends(get_document_service),
 ) -> DocumentOut:
-    return await service.ingest(payload)
+    row, created = await service.ingest(payload)
+    if not created:
+        # 内容已存在：不是错误（同步器周期性重推是正常行为），回 200 并返回已存在那篇
+        response.status_code = status.HTTP_200_OK
+    return row
+
+
+@router.post("/bulk", status_code=status.HTTP_200_OK, response_model=BulkResult, summary="批量提交文档")
+async def create_documents_bulk(
+    payload: BulkDocumentCreate,
+    service: DocumentService = Depends(get_document_service),
+) -> BulkResult:
+    # 批量是【混合结果】（有的新建、有的重复），所以固定 200，逐条状态由 BulkResult 表达
+    return await service.bulk_ingest(payload.documents)
 
 
 @router.get("/{document_id}", response_model=DocumentOut, summary="查询单篇文档")
