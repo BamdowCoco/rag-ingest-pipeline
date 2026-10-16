@@ -195,9 +195,9 @@ class DocumentService:
         单篇与批量都要走这一段，但事务边界各自由调用方决定（批量是每篇一个事务），
         所以提交不放在这里。
 
-        **落库时同时认领这份内容**（写 `document_dedup`）—— 那是 **准入占位**。
-        新建 / 更新 / 复活 **都要认领**：只有这样，「任何时刻 active 内容两两不同」
-        才是条**真不变式**，而不是"只在新建时成立"。
+        **落库时同时认领这份内容** （写 `document_dedup`）—— 那是 **准入占位** 。
+        新建 / 更新 / 复活 **都要认领** ：只有这样，「任何时刻 active 内容两两不同」
+        才是条 **真不变式** ，而不是"只在新建时成立"。
         撞车由 `content_hash` 的唯一索引拦下，报什么由调用方决定。
         """
         # payload 用 mode="json" —— datetime 得变成字符串，JSON 列才存得进去；
@@ -348,7 +348,7 @@ class DocumentService:
         source, external_id = raw["source"], raw["external_id"]
         content_hash = cleaned["content_hash"]
         # 已存在身份的路径（更新 / 复活）撞车时报 409；新建撞车回 200 指向已有那篇。
-        # 差别在于：新建时"这篇已经在库里了"是个正常答案；更新时回 200 却会**静默撒谎**
+        # 差别在于：新建时"这篇已经在库里了"是个正常答案；更新时回 200 却会静默撒谎
         # （调用方以为更新成功，其实文档还停在旧内容）。
         conflict_is_409 = False
 
@@ -357,7 +357,7 @@ class DocumentService:
             current = None
             if src is None:
                 # ---- 新建：先问一句「这份内容是不是已经属于别人了」----
-                # 快路径（Redis SADD）只是省一次查库；**真正的权威是下面落库时的唯一索引**。
+                # 快路径（Redis SADD）只是省一次查库；真正的权威是下面落库时的唯一索引。
                 if not await check_and_mark(self.redis, content_hash):
                     existing = await self._find_existing(content_hash)
                     if existing is not None:
@@ -393,7 +393,7 @@ class DocumentService:
             clean_row = await self._persist(payload, raw, cleaned, ai, source_id=src.id)
 
             if current is not None:
-                # 作废旧版本：它的块一并作废；**它的内容也要释放** ——
+                # 作废旧版本：它的块一并作废；它的内容也要释放 ——
                 # 旧内容不再 active 了，占着位会把"其实已经不在语料里"的内容一直判成重复。
                 # 撤回任务不用在这里创建 —— claim_retractions 按「已 done 且未 retracted」自己筛。
                 await self.repo.supersede_version(current.id)

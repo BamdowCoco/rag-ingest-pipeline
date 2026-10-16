@@ -1,12 +1,12 @@
 """
-内容索引的生命周期（数据库大改 ①）：它现在是 **「active 内容索引」** ，旧内容会被**释放**。
+内容索引的生命周期（数据库大改 ①）：它现在是 **「active 内容索引」** ，旧内容会被 **释放** 。
 
 它守的不变式是： **任何时刻 active 内容两两不同** —— 由 `document_dedup.content_hash` 唯一索引保证。
-所以旧版本被更新 / 删除时，必须把它的内容占位**释放掉**，否则一份「已经不在语料里」的内容
+所以旧版本被更新 / 删除时，必须把它的内容占位 **释放掉** ，否则一份「已经不在语料里」的内容
 会被永远判成重复，而它指向的那个版本早就作废了。
 
 > **注意：内容指纹是 `sha256(标题 + "\\n" + 正文)` —— 含标题。**
-> 所以下面的"撞车"用例都必须用**同一个标题**，否则根本不撞。
+> 所以下面的"撞车"用例都必须用 **同一个标题** ，否则根本不撞。
 """
 from sqlalchemy import select
 
@@ -54,9 +54,9 @@ async def test_delete_releases_the_content(client, make_doc):
 
 async def test_update_into_another_docs_content_is_409(client, make_doc):
     """
-    把 A 改成与 B **相同** 的内容 → **409**。
+    把 A 改成与 B **相同** 的内容 → **409** 。
 
-    这是本次补上的那个漏洞：以前 update 不写内容索引，于是库里能**静默**出现两份 active 同内容，
+    这是本次补上的那个漏洞：以前 update 不写内容索引，于是库里能 **静默** 出现两份 active 同内容，
     唯一索引一点没拦住 —— 那样「唯一索引是权威」这句话只在新建时成立，是假话。
     """
     a = make_doc(source="feishu", external_id="a-3", title=SAME_TITLE, content="甲的独有内容，够长")
@@ -74,7 +74,7 @@ async def test_update_into_another_docs_content_is_409(client, make_doc):
 async def test_conflict_also_rolls_back_the_release(client, make_doc):
     """
     撞车时 **旧内容的释放也要一并回滚** —— 否则 A 会既没更新成功、原内容占位还丢了。
-    （释放与认领放在**同一个事务**里，意义就在这里。）
+    （释放与认领放在 **同一个事务** 里，意义就在这里。）
     """
     a = make_doc(source="feishu", external_id="a-4", title=SAME_TITLE, content="甲的独有内容，够长")
     b = make_doc(source="yuque", external_id="b-4", title=SAME_TITLE, content="乙的独有内容，够长")
@@ -93,7 +93,7 @@ async def test_conflict_also_rolls_back_the_release(client, make_doc):
 
 
 async def test_new_document_hitting_existing_content_is_still_200(client, make_doc):
-    """新建撞车的语义**没变**：回 200 并指向已有那篇（那不是冲突，是"这篇已经在库里了"）。"""
+    """新建撞车的语义 **没变** ：回 200 并指向已有那篇（那不是冲突，是"这篇已经在库里了"）。"""
     a = make_doc(source="feishu", external_id="a-5", title=SAME_TITLE, content="共用的内容，够长")
     first = await client.post("/api/v1/documents", json=a)
     assert first.status_code == 201
