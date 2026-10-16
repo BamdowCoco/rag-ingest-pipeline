@@ -208,6 +208,12 @@ class DocumentService:
             raw_content=raw["content"],
             payload=payload.model_dump(mode="json"),
         )
+        # enrich 可能从正文开头补了 author —— 但 `author` 是 insert_clean 的【具名参数】，
+        # ai 展开时若再带一个同名字段，就会撞"重复关键字"。所以先 pop 出来。
+        # 优先用补出来的值；enrich 只在调用方没给时才补，所以不会覆盖上游明确给的值。
+        ai = dict(ai)
+        author = ai.pop("author", None) or raw.get("author")
+
         clean_row = await self.repo.insert_clean(
             raw_id=raw_row.id,
             source=raw["source"],
@@ -216,12 +222,12 @@ class DocumentService:
             content_hash=cleaned["content_hash"],
             title=cleaned["title"],
             content=cleaned["content"],
-            author=raw.get("author"),
+            author=author,
             url=raw.get("url"),
             doc_updated_at=raw.get("doc_updated_at"),
             char_count=cleaned["char_count"],
             clean_version=cleaned["clean_version"],
-            **ai,                                  # doc_type / tags / ai_summary
+            **ai,                                  # doc_type / tags / ai_summary / language / enrich_version
         )
         # 切块：文档落库后立刻切。chunk 与文档在【同一个事务】里 ——
         # 要么文档和它的块都在，要么都不在，不留半截数据。
@@ -389,7 +395,7 @@ class DocumentService:
                     logger.info("身份复活 ext=%s", external_id)
 
             # ---- AI 接缝：判定之后、落库之前 ----
-            ai = await enrich(cleaned)
+            ai = await enrich(cleaned, raw)
             clean_row = await self._persist(payload, raw, cleaned, ai, source_id=src.id)
 
             if current is not None:

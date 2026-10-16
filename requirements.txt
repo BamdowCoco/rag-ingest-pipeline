@@ -17,3 +17,5 @@ tiktoken>=0.7.0
 py3langid>=0.2
 # 数据库迁移：改 schema 不再"重建库丢数据"（app 的 lifespan 里要跑 `upgrade head`，所以是运行依赖）
 alembic>=1.13
+# 中文关键词抽取（enrich）：首次调用要加载词典，所以 Dockerfile 在构建期预热一次
+jieba>=0.42.1
