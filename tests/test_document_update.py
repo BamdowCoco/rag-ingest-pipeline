@@ -85,22 +85,6 @@ async def test_same_content_under_a_different_identity_is_rejected_as_duplicate(
     assert (await client.get("/api/v1/documents")).json()["total"] == 1
 
 
-async def test_update_does_not_go_through_admission_check(client, make_doc):
-    """
-    更新 **不参与内容准入** —— 哪怕新内容正好和别人的一样，也不该卡住自己的更新。
-    """
-    other = make_doc(source="yuque", external_id="other-1", content="别人的正文")
-    await client.post("/api/v1/documents", json=other)
-
-    mine = make_doc(source="feishu", external_id="mine-1", content="我的第一版")
-    await client.post("/api/v1/documents", json=mine)
-
-    # 把我的文档改成「和别人一模一样」的内容 —— 应该更新成功，而不是被当成重复
-    r = await client.post(
-        "/api/v1/documents", json={**mine, "content": "别人的正文", "title": other["title"]}
-    )
-    assert r.status_code == 200
-    assert (await client.get("/api/v1/documents")).json()["total"] == 2
 
 
 async def test_fast_path_cache_written_and_cleared(client, make_doc, redis):

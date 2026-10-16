@@ -5,8 +5,8 @@
 （每次更新都新增一行），所以 `UNIQUE(source, external_id)` 根本没地方建。
 「身份」和「版本」是两件事 —— 一张表装不下。这正是本段要解决的那个诊断。
 
-同步器侧的 `external_id` 就是飞书 / Confluence 的文档 ID。
-没有它的文档没有身份行，依旧走老的「只新增 + 内容去重」路径。
+同步器侧的 `external_id` 就是飞书 / Confluence 的文档 ID， **必填** ——
+它就是「文档身份」；没有身份，系统分不清"同一篇改过了"和"这是一篇新文档"。
 """
 from datetime import datetime
 

@@ -26,6 +26,10 @@ class DocumentInProgressError(AppError):
     """该文档正在被另一个请求处理，请稍后重试"""
 
 
+class ContentConflictError(AppError):
+    """要推的内容已经属于另一篇文档"""
+
+
 class EmptyContentError(AppError):
     """标准化后正文为空"""
 
@@ -43,6 +47,7 @@ _ERROR_STATUS = {
     DocumentNotFoundError: status.HTTP_404_NOT_FOUND,
     ChunkNotFoundError: status.HTTP_404_NOT_FOUND,
     DocumentInProgressError: status.HTTP_409_CONFLICT,
+    ContentConflictError: status.HTTP_409_CONFLICT,
     EmptyContentError: status.HTTP_422_UNPROCESSABLE_CONTENT,
 }
 

@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.exceptions import (
+    ContentConflictError,
     DocumentInProgressError,
     DocumentNotFoundError,
     EmptyContentError,
@@ -52,7 +53,7 @@ from app.services.dedup_service import (
     check_and_mark,
     get_rejected_count,
     incr_rejected,
-    rollback_mark,
+    release_mark,
 )
 from app.services.enrich_service import enrich
 from app.services.lock_service import LockNotAcquired, document_lock
@@ -187,7 +188,6 @@ class DocumentService:
         ai: dict,
         *,
         source_id: int,
-        claim_dedup: bool,
     ) -> DocumentClean:
         """
         三表顺序落库：raw → clean → dedup（顺带切块）， **只 flush、不 commit** 。
@@ -195,9 +195,10 @@ class DocumentService:
         单篇与批量都要走这一段，但事务边界各自由调用方决定（批量是每篇一个事务），
         所以提交不放在这里。
 
-        `claim_dedup=True` 才写 `document_dedup` —— 它是 **准入占位** ：
-        只有「新建文档」才认领一份内容；更新 / 复活属于版本操作， **不参与内容准入**
-        （它们的新内容可能正好和别人的一样，那不该卡住自己的更新）。
+        **落库时同时认领这份内容**（写 `document_dedup`）—— 那是 **准入占位**。
+        新建 / 更新 / 复活 **都要认领**：只有这样，「任何时刻 active 内容两两不同」
+        才是条**真不变式**，而不是"只在新建时成立"。
+        撞车由 `content_hash` 的唯一索引拦下，报什么由调用方决定。
         """
         # payload 用 mode="json" —— datetime 得变成字符串，JSON 列才存得进去；
         # 而 doc_updated_at 那列要的是真 datetime，所以两个 dump 各取所需
@@ -227,9 +228,9 @@ class DocumentService:
         chunks = make_chunks(cleaned)
         await self.repo.insert_chunks(clean_row.id, chunks)
 
-        if claim_dedup:
-            await self.dedup_repo.insert_dedup(cleaned["content_hash"], clean_row.id)
-        logger.info("落库完成 doc_id=%s 块数=%d 准入认领=%s", clean_row.id, len(chunks), claim_dedup)
+        # 认领这份内容 —— 唯一索引是权威，撞车就抛 IntegrityError，报什么由调用方决定
+        await self.dedup_repo.insert_dedup(cleaned["content_hash"], clean_row.id)
+        logger.info("落库完成 doc_id=%s 块数=%d", clean_row.id, len(chunks))
         return clean_row
 
     async def _find_existing(self, content_hash: str) -> DocumentClean | None:
@@ -346,42 +347,42 @@ class DocumentService:
         """
         source, external_id = raw["source"], raw["external_id"]
         content_hash = cleaned["content_hash"]
-        claimed = False          # 这次有没有占住「内容准入」的位（决定失败时要不要撤）
+        # 已存在身份的路径（更新 / 复活）撞车时报 409；新建撞车回 200 指向已有那篇。
+        # 差别在于：新建时"这篇已经在库里了"是个正常答案；更新时回 200 却会**静默撒谎**
+        # （调用方以为更新成功，其实文档还停在旧内容）。
+        conflict_is_409 = False
 
         try:
             src = await self.repo.get_source(source, external_id, for_update=True)
             current = None
             if src is None:
-                # ---- 准入检查：这是「新文档进门」，先问「这份内容是不是已经属于别人了」----
-                # 只在身份行都不存在时做 —— 更新 / 复活是版本操作、不参与内容准入
-                # （它们的新内容可能正好与别人的一样，那不该卡住自己的更新）。
-                claimed = await check_and_mark(self.redis, content_hash)
-                if not claimed:
+                # ---- 新建：先问一句「这份内容是不是已经属于别人了」----
+                # 快路径（Redis SADD）只是省一次查库；**真正的权威是下面落库时的唯一索引**。
+                if not await check_and_mark(self.redis, content_hash):
                     existing = await self._find_existing(content_hash)
                     if existing is not None:
-                        # 同前：用 commit 收尾而不是 rollback —— 本事务只读过，
+                        # 用 commit 收尾而不是 rollback —— 本事务只读过，
                         # 而 rollback 会把已加载对象的属性全部过期，之后 FastAPI
                         # 在同步上下文里取属性就 MissingGreenlet。
                         await self.db.commit()
                         await incr_rejected(self.redis)
                         logger.info("准入检查 → 内容已属于别人 hash=%s", content_hash[:12])
                         return existing, False, False
-                    # Redis 说"见过"、库里却没有 → 不一致态（罕见且自愈），继续按新建走。
-                    # 注意这里 claimed 仍是 False：没占位，失败时也不该去 SREM。
+                    # Redis 说"见过"、索引里却没有 → 旧占位的幽灵（罕见、自愈），继续按新建走
                 src = await self.repo.insert_source(source, external_id)
                 created, changed = True, True
             else:
                 current = await self.repo.get_active_version(src.id)
                 if current is not None and current.content_hash == content_hash:
                     # 内容没变 —— 不是错误，回【当前那一版】
-                    # 用 commit 而不是 rollback 收尾：本事务只有一次 SELECT ... FOR UPDATE（没写过东西），
-                    # 而 rollback 会把已加载对象的属性全部过期 —— 之后 FastAPI 在同步上下文里
-                    # 取属性就会 MissingGreenlet。commit 同样释放行锁，且 expire_on_commit=False 让属性留着。
+                    # 同上：用 commit 而不是 rollback，避免属性被过期。
                     await self.db.commit()
                     await incr_rejected(self.redis)      # 它确实挡掉了一次重复同步
                     logger.info("身份判重 → 内容未变 ext=%s", external_id)
                     return current, False, False
+
                 created, changed = False, True
+                conflict_is_409 = True       # 已存在身份 → 内容撞车是冲突，不是"已存在"
                 if src.deleted_at is not None:
                     # 源系统删过、又推回来了 → 复活
                     src.deleted_at = None
@@ -389,30 +390,38 @@ class DocumentService:
 
             # ---- AI 接缝：判定之后、落库之前 ----
             ai = await enrich(cleaned)
-            clean_row = await self._persist(
-                payload, raw, cleaned, ai, source_id=src.id, claim_dedup=claimed
-            )
+            clean_row = await self._persist(payload, raw, cleaned, ai, source_id=src.id)
 
             if current is not None:
-                # 作废旧版本；它的块一并作废。
+                # 作废旧版本：它的块一并作废；**它的内容也要释放** ——
+                # 旧内容不再 active 了，占着位会把"其实已经不在语料里"的内容一直判成重复。
                 # 撤回任务不用在这里创建 —— claim_retractions 按「已 done 且未 retracted」自己筛。
                 await self.repo.supersede_version(current.id)
                 await self.chunk_repo.supersede_by_document(current.id)
+                await self.dedup_repo.delete_by_content_hash(current.content_hash)
 
             await self.db.commit()
         except IntegrityError:
             # 【必须 rollback】：不回滚，session 就废了，后续任何操作都会报错。
+            # 注意：更新路径上"释放旧内容"也在这个事务里，回滚会把它一并撤销 ✓。
             await self.db.rollback()
-            if claimed:
-                await rollback_mark(self.redis, content_hash)   # 撤掉准入占位
-                existing = await self._find_existing(content_hash)
-                if existing is not None:
-                    await incr_rejected(self.redis)
-                    logger.info("准入检查（唯一索引兜底）→ 内容已属于别人 hash=%s", content_hash[:12])
-                    return existing, False, False
+            await release_mark(self.redis, content_hash)     # 撤掉刚做的快路径占位
+            existing = await self._find_existing(content_hash)
+            if existing is not None:
+                await incr_rejected(self.redis)
+                if conflict_is_409:
+                    logger.info("内容撞车（更新/复活）hash=%s", content_hash[:12])
+                    raise ContentConflictError() from None
+                logger.info("准入检查（唯一索引兜底）→ 内容已属于别人 hash=%s", content_hash[:12])
+                return existing, False, False
             # 否则是并发创建同一身份 → 唯一约束拦下。报 409，让同步器下一轮重推。
             logger.warning("身份并发创建冲突 ext=%s", external_id)
             raise DocumentInProgressError() from None
+
+        # Redis 快路径 best-effort 跟上（DB 是权威；不一致会自愈）
+        if current is not None:
+            await release_mark(self.redis, current.content_hash)   # 旧内容不再 active
+        await check_and_mark(self.redis, content_hash)             # 新内容占位（幂等）
 
         await self._remember_version(source, external_id, clean_row)   # write-through 快路径
         logger.info(
@@ -429,9 +438,10 @@ class DocumentService:
         「active 版本还在、`deleted_at` 却已置上」，那条「deleted ⇒ 没有 active 版本」
         的不变式就破了（读路径靠它才不用 join 到 document_source）。
 
-        一个事务里：作废 active 版本 + 它的块 → 置 `deleted_at` → bump 列表版本号。
+        一个事务里：作废 active 版本 + 它的块 + **释放它的内容占位** → 置 `deleted_at` → bump 列表版本号。
         """
         lock_id = self._identity_lock_id(payload.source, payload.external_id)
+        released_hash: str | None = None      # 被释放占位的那份内容，删完要在 Redis 里也放行
         try:
             async with document_lock(self.redis, lock_id):
                 src = await self.repo.get_source(
@@ -446,11 +456,16 @@ class DocumentService:
                 if current is not None:
                     await self.repo.supersede_version(current.id)
                     await self.chunk_repo.supersede_by_document(current.id)
+                    # 文档都没了，它的内容不该继续占着「准入」的位
+                    await self.dedup_repo.delete_by_content_hash(current.content_hash)
+                    released_hash = current.content_hash
                 await self.db.commit()
         except LockNotAcquired:
             logger.info("未拿到锁（同身份正在处理）ext=%s", payload.external_id)
             raise DocumentInProgressError() from None
 
+        if released_hash is not None:
+            await release_mark(self.redis, released_hash)
         # 必须把快路径也清掉：否则下次推同样的内容会命中缓存，把"已删除的版本"直接回给调用方
         await cache_delete(
             self.redis, document_version_key(payload.source, payload.external_id)
