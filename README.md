@@ -46,7 +46,8 @@
 content_hash = sha256(title + "\n" + cleaned_content)
 ```
 
-判重跟的是**内容**，不是标题、也不是 URL——**同一份文档换个标题再传一遍，照样拦住**。
+指纹算的是 **标准化后的「标题 + 正文」** —— 不含来源、不含 URL。所以同一篇稿子在别处转载会被拦住。
+反过来也要说清： **标题变了，指纹就变了**（那种情况拦不住）—— 公式里带着标题，这是刻意的。
 
 ### 2. 双层去重：快路径 + 权威兜底
 
@@ -234,6 +235,15 @@ docker compose up -d --build
 docker compose ps         # 各服务应为 healthy / running
 ```
 浏览器打开 **http://localhost:8000/docs**。
+
+> **表结构是怎么来的：** api 启动时会自动跑 `alembic upgrade head` —— 空库首启就把表建好，
+> 以后改 schema 再写一条迁移升上去即可，**不用再重建库、丢数据**。迁移文件在 `alembic/versions/`：
+> ```bash
+> docker compose exec api alembic revision --autogenerate -m "说明"   # 生成
+> docker compose exec api alembic upgrade head                        # 应用
+> ```
+> （给一个**已有数据**的库首次引入迁移时，要先 `alembic stamp head` 打上版本戳，
+> 否则它会去建已经存在的表。）
 
 ### 3. 手动发一篇
 ```bash

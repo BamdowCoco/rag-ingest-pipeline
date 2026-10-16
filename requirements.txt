@@ -15,3 +15,5 @@ redis>=8.1.0
 tiktoken>=0.7.0
 # 语言检测（enrich）：纯 Python，模型内置在包里，不需要构建期联网预热
 py3langid>=0.2
+# 数据库迁移：改 schema 不再"重建库丢数据"（app 的 lifespan 里要跑 `upgrade head`，所以是运行依赖）
+alembic>=1.13
