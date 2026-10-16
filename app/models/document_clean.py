@@ -43,8 +43,12 @@ class DocumentClean(Base):
     # 非 NULL = 「我已不是当前版本」。列表 / 统计一律把它过滤掉。
     superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
-    # ---------- AI 接缝（阶段 9 才填，先留可空，接大模型时不用改表） ----------
+    # ---------- AI 接缝（阶段 9 留位，阶段 G 起真的开始填） ----------
     doc_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
     # 标签天然是多值 —— 用 JSON 存列表，而不是逗号分隔的 String
     tags: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     ai_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    language: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    # 用哪一版规则 enrich 的（对齐 clean_version）—— 规则改了，得知道哪些行该重跑。
+    # 可空是为了将来 provider=off 时能写 NULL（表示"没做过"），与"做了但都是空"区分开。
+    enrich_version: Mapped[int | None] = mapped_column(nullable=True)

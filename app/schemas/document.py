@@ -35,6 +35,7 @@ class DocumentOut(BaseModel):
     doc_type: str | None = None
     tags: list[str] | None = None
     ai_summary: str | None = None
+    language: str | None = None
 
 
 class DocumentDelete(BaseModel):

@@ -13,3 +13,5 @@ pydantic-settings>=2.15.0
 redis>=8.1.0
 # 切块要精确数 token（下游的上下文上限与 embedding 计费都按 token）
 tiktoken>=0.7.0
+# 语言检测（enrich）：纯 Python，模型内置在包里，不需要构建期联网预热
+py3langid>=0.2

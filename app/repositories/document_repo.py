@@ -193,6 +193,8 @@ class DocumentRepo:
         doc_type: str | None = None,
         tags: list[str] | None = None,
         ai_summary: str | None = None,
+        language: str | None = None,
+        enrich_version: int | None = None,
     ) -> DocumentClean:
         row = DocumentClean(
             raw_id=raw_id,
@@ -210,6 +212,8 @@ class DocumentRepo:
             doc_type=doc_type,
             tags=tags,
             ai_summary=ai_summary,
+            language=language,
+            enrich_version=enrich_version,
         )
         self.db.add(row)
         await self.db.flush()   # 同样只为拿 clean.id 给 dedup.clean_id 用
