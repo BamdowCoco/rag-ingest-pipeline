@@ -20,7 +20,9 @@ from app.core.config import settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import setup_logging
 from app.db.session import engine
+from app.infra.model_client import close_model_client
 from app.infra.redis_client import close_redis, redis_client
+from app.services.enricher import enrich_loop
 from app.services.reclaimer import reclaim_loop
 
 setup_logging()  # 必须在其它模块打日志之前调用
@@ -55,16 +57,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await asyncio.to_thread(_upgrade_schema)
     logger.info("数据库表已就绪")
 
-    # 后台回收任务：起一个 asyncio task（为什么独立出来，见 reclaimer.py 的说明）
-    reclaimer = asyncio.create_task(reclaim_loop())
+    # ---------- 后台任务 ----------
+    # 两个应用内的循环，职责不同、形状一样（都是 lifespan 起停 + 每轮吞异常）：
+    #   reclaimer —— 把"卡住的"放回去（chunk 的 processing、文档的 enrich processing）
+    #   enricher  —— 把"待办的"做掉（模型调用是秒级外部依赖，不能压在请求路径里）
+    background = [
+        asyncio.create_task(reclaim_loop()),
+        asyncio.create_task(enrich_loop()),
+    ]
 
     yield
 
     # ---------- 关停 ----------
     # 顺序要紧：先取消后台任务、再关连接池。反过来的话，任务可能拿到已 dispose 的池。
-    reclaimer.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await reclaimer
+    for task in background:
+        task.cancel()
+    for task in background:
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    await close_model_client()  # 释放模型服务客户端的连接池
     await close_redis()         # 释放 Redis 连接池
     await engine.dispose()      # 释放数据库连接池
     logger.info("已关闭 %s", settings.app_name)

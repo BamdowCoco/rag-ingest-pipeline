@@ -5,8 +5,7 @@
 阶段 5：ingest() —— 标准化 → 判重(快路径) → 三表落库。
 阶段 6：给 ingest 的临界区套上按 hash 粒度的分布式锁。
 阶段 7：列表与单篇都走 Cache-Aside；写入成功后 bump 列表版本号。
-阶段 9：service 不再抛 HTTPException（改为业务异常，HTTP 映射在 core/exceptions.py）；
-        补处理日志；插入 AI 接缝 enrich（失败不阻断入库）。
+阶段 9：service 不再抛 HTTPException（改为业务异常，HTTP 映射在 core/exceptions.py）；补处理日志；插入 AI 接缝 enrich（失败不阻断入库）。
 阶段 B：落库后接上【切块】；新增分块查询（纯 TTL 缓存）。
 阶段 D：重复改为「不是错误」（返回已存在那篇）；新增批量摄入 bulk_ingest（pipeline 判重）。
 """
@@ -55,7 +54,6 @@ from app.services.dedup_service import (
     incr_rejected,
     release_mark,
 )
-from app.services.enrich_service import enrich
 from app.services.lock_service import LockNotAcquired, document_lock
 from app.utils.time import beijing_today_utc_range, utcnow
 
@@ -78,7 +76,7 @@ class DocumentService:
         """
         列表查询（Cache-Aside）。返回 (本页数据 dict 列表, 满足条件的总数)。
 
-        带 `q` 的请求【不进缓存】：q 是自由文本、键空间无上限（能被刷爆），
+        带 ``q`` 的请求【不进缓存】：q 是自由文本、键空间无上限（能被刷爆），
         且命中率极低 —— 直接查库反而更划算。
         """
         cache_key: str | None = None
@@ -185,7 +183,6 @@ class DocumentService:
         payload: DocumentCreate,
         raw: dict,
         cleaned: dict,
-        ai: dict,
         *,
         source_id: int,
     ) -> DocumentClean:
@@ -195,10 +192,13 @@ class DocumentService:
         单篇与批量都要走这一段，但事务边界各自由调用方决定（批量是每篇一个事务），
         所以提交不放在这里。
 
-        **落库时同时认领这份内容** （写 `document_dedup`）—— 那是 **准入占位** 。
+        **落库时同时认领这份内容** （写 ``document_dedup``）—— 那是 **准入占位** 。
         新建 / 更新 / 复活 **都要认领** ：只有这样，「任何时刻 active 内容两两不同」
         才是条 **真不变式** ，而不是"只在新建时成立"。
-        撞车由 `content_hash` 的唯一索引拦下，报什么由调用方决定。
+        撞车由 ``content_hash`` 的唯一索引拦下，报什么由调用方决定。
+
+        **enrich 那几列这里一个字都不写** —— 它们由后台循环补（见 ``enricher.py``），
+        落库时 ``enrich_status`` 还是默认的 ``pending``。这正是「AI 不拦请求」的落点。
         """
         # payload 用 mode="json" —— datetime 得变成字符串，JSON 列才存得进去；
         # 而 doc_updated_at 那列要的是真 datetime，所以两个 dump 各取所需
@@ -208,12 +208,6 @@ class DocumentService:
             raw_content=raw["content"],
             payload=payload.model_dump(mode="json"),
         )
-        # enrich 可能从正文开头补了 author —— 但 `author` 是 insert_clean 的【具名参数】，
-        # ai 展开时若再带一个同名字段，就会撞"重复关键字"。所以先 pop 出来。
-        # 优先用补出来的值；enrich 只在调用方没给时才补，所以不会覆盖上游明确给的值。
-        ai = dict(ai)
-        author = ai.pop("author", None) or raw.get("author")
-
         clean_row = await self.repo.insert_clean(
             raw_id=raw_row.id,
             source=raw["source"],
@@ -222,12 +216,11 @@ class DocumentService:
             content_hash=cleaned["content_hash"],
             title=cleaned["title"],
             content=cleaned["content"],
-            author=author,
+            author=raw.get("author"),          # enrich 补的署名由后台写回，不在这里
             url=raw.get("url"),
             doc_updated_at=raw.get("doc_updated_at"),
             char_count=cleaned["char_count"],
             clean_version=cleaned["clean_version"],
-            **ai,                                  # doc_type / tags / ai_summary / language / enrich_version
         )
         # 切块：文档落库后立刻切。chunk 与文档在【同一个事务】里 ——
         # 要么文档和它的块都在，要么都不在，不留半截数据。
@@ -250,7 +243,8 @@ class DocumentService:
         """
         整条管道：标准化 → **快路径** → 加锁 → 身份判断 → 三表落库 → 提交 → bump 列表版本号。
 
-        只有一条路：`external_id` 就是文档身份。
+        只有一条路：``external_id`` 就是文档身份。
+
         - **快路径** （不查库、不抢锁）：命中且内容没变 → 直接回当前版本
         - **库路径** ：没有身份行 → 过准入检查后新建；有 → 比 hash 决定跳过还是更新
 
@@ -291,8 +285,8 @@ class DocumentService:
         身份版本快路径：缓存命中且内容没变 → 直接回【当前版本】。
 
         **它挡的是最常见的流量** ：同步器周期性重推一篇没变的文档。
-        没这一步，每次重推都要 `SELECT ... FOR UPDATE` 去抢一次行锁 —— 又慢、又互相排队。
-        缓存里存 `{clean_id, content_hash}`：光有 hash 不够，还得有 id 才能取出文档本体回给调用方。
+        没这一步，每次重推都要 ``SELECT ... FOR UPDATE`` 去抢一次行锁 —— 又慢、又互相排队。
+        缓存里存 ``{clean_id, content_hash}``：光有 hash 不够，还得有 id 才能取出文档本体回给调用方。
 
         **失败模式** ：这份缓存错了是 **「漏一次更新」** （把新内容当成没变），
         不是去重 SET 那种「多拒一次」—— 严重性不同，所以它 write-through + TTL 兜底。
@@ -344,10 +338,11 @@ class DocumentService:
         返回 (文档, 是否新建, active 集合有没有变动)。
 
         并发上分三层（形状与既有的「双层去重」一致）：
+
         - 快路径：Redis 身份锁（把并发同篇变成 **快速 409** ）
-        - **权威** ：下面这把 `SELECT ... FOR UPDATE` **行锁** —— 真正串行化更新；
-          `bulk_ingest` 没有 Redis 锁，就全靠它
-        - 兜底：`UNIQUE(source, external_id)` —— 并发 **创建** 同一身份时拦下
+        - **权威** ：下面这把 ``SELECT ... FOR UPDATE`` **行锁** —— 真正串行化更新；
+          ``bulk_ingest`` 没有 Redis 锁，就全靠它
+        - 兜底：``UNIQUE(source, external_id)`` —— 并发 **创建** 同一身份时拦下
 
         **调用方负责拿锁** （单篇拿 Redis 锁；批量有意不拿，省往返）。
         """
@@ -394,9 +389,7 @@ class DocumentService:
                     src.deleted_at = None
                     logger.info("身份复活 ext=%s", external_id)
 
-            # ---- AI 接缝：判定之后、落库之前 ----
-            ai = await enrich(cleaned, raw)
-            clean_row = await self._persist(payload, raw, cleaned, ai, source_id=src.id)
+            clean_row = await self._persist(payload, raw, cleaned, source_id=src.id)
 
             if current is not None:
                 # 作废旧版本：它的块一并作废；它的内容也要释放 ——
@@ -441,10 +434,10 @@ class DocumentService:
         删除信号（ **幂等** ，返回本次是否真的删掉了）。
 
         和更新一样 **必须拿同一把身份锁** —— 否则会和 ingest 交错出
-        「active 版本还在、`deleted_at` 却已置上」，那条「deleted ⇒ 没有 active 版本」
+        「active 版本还在、``deleted_at`` 却已置上」，那条「deleted ⇒ 没有 active 版本」
         的不变式就破了（读路径靠它才不用 join 到 document_source）。
 
-        一个事务里：作废 active 版本 + 它的块 + **释放它的内容占位** → 置 `deleted_at` → bump 列表版本号。
+        一个事务里：作废 active 版本 + 它的块 + **释放它的内容占位** → 置 ``deleted_at`` → bump 列表版本号。
         """
         lock_id = self._identity_lock_id(payload.source, payload.external_id)
         released_hash: str | None = None      # 被释放占位的那份内容，删完要在 Redis 里也放行
@@ -485,12 +478,12 @@ class DocumentService:
         批量摄入（同步器的真实调用方式）。 **与单篇走同一条路** ，只是不拿 Redis 锁：
 
         1. 每篇先过 **身份版本快路径** —— 重推没变的文档在这一步就被挡掉，不查库、不加锁
-        2. 剩下的逐篇走 `_apply_identified`， **不加分布式锁** ：
+        2. 剩下的逐篇走 ``_apply_identified``， **不加分布式锁** ：
            一次加锁 ≈ 2 次往返/篇，会把快路径省下的又加回去；
-           正确性交给 `document_source` 那一行的 **行锁 + 唯一约束**
+           正确性交给 ``document_source`` 那一行的 **行锁 + 唯一约束**
         3. 重复 **按条跳过** 、不报错：同步器周期重推是正常行为
 
-        按 **下标** 把结果填回同一个 `items`，所以出参顺序与请求一致。
+        按 **下标** 把结果填回同一个 ``items``，所以出参顺序与请求一致。
         """
         total = len(payloads)
         items: list[BulkItemResult | None] = [None] * total

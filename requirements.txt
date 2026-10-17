@@ -19,3 +19,5 @@ py3langid>=0.2
 alembic>=1.13
 # 中文关键词抽取（enrich）：首次调用要加载词典，所以 Dockerfile 在构建期预热一次
 jieba>=0.42.1
+# enrich 调模型服务走 HTTP（阶段 H）—— 以前它只是 dev 依赖，现在 api 运行期真的要用
+httpx>=0.28.1

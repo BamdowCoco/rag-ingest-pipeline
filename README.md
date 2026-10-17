@@ -127,20 +127,60 @@ content_hash = sha256(title + "\n" + cleaned_content)
 
 > 「失效策略取决于**数据可变性**」——这里文档与 chunk 都不可变，所以纯 TTL 是正确答案，一行失效逻辑都不用写。
 
-### 8. AI 接缝：从「留了位」到「真的在跑」
+### 8. AI 接缝：从「留了位」到「真的在跑」，再到「可插拔」
 
-`enrich()` 插在 **判定之后、落库之前** ，给文档补几列字段。铁律： **AI 是可选增强，失败绝不阻断入库** ——
+`enrich()` 给文档补几列字段（语言 / 摘要 / 关键词 / 署名）。铁律： **AI 是可选增强，失败绝不阻断入库** ——
 出错只让 **那一项** 留 NULL（**逐项降级**：语言挂了不连累摘要）。
 
-**已经落地的四项**（都是纯 Python / 本地词典，不依赖任何模型服务）：
+**默认那四项是纯 Python / 本地词典的**（不依赖任何模型服务）：
 - **语言检测** → `language`（`py3langid`；文本太短就留空）
 - **简单摘要** → `ai_summary`（ **首段 + 尾段 + 截断** ，不上 textrank、更不上 LLM）
 - **关键词** → `tags`（`jieba` 的 TF-IDF）
 - **署名** → `author`，**只在正文开头几行**里认 `作者：X` / `文/ X` ——
   正文中间出现的"作者："很可能只是在**引用**别人，**猜错比留空更糟**
 
-另外把 **`enrich_version`** 记在这一行上 —— 与 `clean_version` 一个思路：
-**规则改了，得知道哪些行该重跑**。`doc_type` 仍空着，留给阶段 H 的模型服务。
+**需要更高质量时可以切到模型服务，管道一行不改** —— 一个配置项切四档：
+
+| `ENRICH_PROVIDER` | 行为 | 契约是谁定的 |
+|---|---|---|
+| `rule`（默认） | 上面那四项纯 Python 规则，**不出网** | — |
+| `model` | 调 HTTP 上游：`POST {text} → {summary, keywords, language}`（**网关形态**） | **我方** |
+| `openai_compat` | **OpenAI 兼容协议**：`messages` 数组 → `choices[0].message.content`，长度看 `max_tokens`；**路径与 JSON 模式都可配**（`ENRICH_OPENAI_PATH` / `ENRICH_JSON_MODE`） | 协议方（自建 vLLM / Ollama / 云厂商兼容端点） |
+| `off` | 什么都不做，几列全 NULL（"能关掉"也是降级开关） | — |
+
+**三个 HTTP 之外的档都自动回落到 `rule`**：上游超时 / 4xx / 5xx / 响应形状不对 → 回落纯 Python → 几列仍有值。
+**接第三家厂商只加一个文件**（`app/services/enrich_providers/` 里一个 provider 一个文件），
+**表结构、状态机、后台循环、调用方都不用动** —— 这就是"适配层"的含义。
+
+> **`model/` 容器里那个"模型"是替身 —— 替身的是服务端，不是"HTTP 调用"这件事。**
+> 它还故意**讲两种契约**（`/enrich` 与 `/v1/chat/completions`），于是
+> "适配层到底在翻译什么"不用嘴说：**一个上游、两个适配器、两种解析**。
+> 为什么需要适配层、四种上游形态的差别，见
+> [`docs/RAG数据接入与预处理管道项目疑问.md`](docs/RAG数据接入与预处理管道项目疑问.md) 的 **Q3** 。
+
+**几处形状上的讲究，都是这几轮改出来的：**
+
+- **它不在请求路径上。** 模型调用是 **秒级外部依赖** ，而 `bulk_ingest` 是 **逐篇** 走的 ——
+  留在请求里，"同步器一次推 200 篇"就是 **10 分钟**。所以入库只写 `enrich_status = 'pending'`，
+  补全交给 lifespan 起的**后台循环**：认领（`SKIP LOCKED`）→ 补 → 写回，形状与 chunk 的任务队列**完全一致**，
+  也共用同一套**超时回收**（补它的进程挂了，卡在 `processing` 的会被放回 `pending`）。
+- **`enrich_version` 记下这一行是哪一版规则补的** —— 与 `clean_version` 一个思路：
+  **规则改了，得知道哪些行该重跑**。
+- **只发样本，不发整篇。** 摘要本来只用首尾段，而调用按 **输入全长** 计费 ——
+  所以发之前先取"首段 + 尾段"（`app/utils/sample.py`，超长时两头截），长文档不再白烧 token。
+- **解析失败要抛，不许默默留 NULL。** 响应形状不对是"**接法错了**"，不是"这篇文档没有摘要" ——
+  静默留空会把这两件事混成一个，排查时无从下手。抛出去正好走降级链。
+
+> **上游挂了会怎样？** 入库照样成功 —— 降级链把它兜住了。这也是 `model` 服务在
+> `docker-compose.yml` 里 **故意不写 `depends_on`** 的原因：它挂了，整套照常起、照常收文档。
+> 现场验收（`ENRICH_PROVIDER` 走 `.env`，改完要重建 api 容器它才读得到新的环境变量；
+> **跑测试前记得把它删掉** —— 测试容器也读 `.env`）：
+> ```bash
+> sed -i 's/^ENRICH_PROVIDER=.*/ENRICH_PROVIDER=openai_compat/' .env && docker compose up -d api
+> # 发一篇文档 → 等后台补完 → 摘要里会出现样本标记 [中间省略]（规则侧不可能产出它）
+> docker compose stop model      # 把上游停掉
+> # 再发一篇 → 依然 201 入库；那几列是规则算出来的值（摘要里带 " … "、tags 是 jieba 真词）
+> ```
 
 ---
 
@@ -150,10 +190,12 @@ content_hash = sha256(title + "\n" + cleaned_content)
 |---|---|
 | Web 框架 | FastAPI |
 | 数据库 | MySQL 8 + SQLAlchemy 2.0 Async + aiomysql |
+| 迁移 | Alembic（启动时 `upgrade head`） |
 | 缓存 / 去重 / 锁 | Redis 7 + `redis.asyncio` |
 | 配置 | pydantic-settings（`.env` 驱动） |
-| 容器 | Docker + Docker Compose（api + mysql + redis + **syncer** + **embedder**） |
-| 同步 / Worker | httpx（异步批量推送、认领任务，均可 `--scale` 多实例） |
+| 容器 | Docker + Docker Compose（api + mysql + redis + **syncer** + **embedder** + **model**） |
+| 同步 / Worker | httpx（异步批量推送、认领任务、调模型服务；前两者可 `--scale` 多实例） |
+| AI 增强 | `py3langid`（语言）+ `jieba`（关键词）+ 本项目的极简摘要 / 署名规则；**可选**换成 HTTP 上游（含 **OpenAI 兼容**协议，只加一个 provider 文件） |
 | 测试 | pytest + pytest-asyncio |
 
 ---
@@ -163,7 +205,7 @@ content_hash = sha256(title + "\n" + cleaned_content)
 ```
 rag-ingest-pipeline/
 ├── app/
-│   ├── main.py                      # FastAPI 入口，lifespan 关闭 redis/engine
+│   ├── main.py                      # FastAPI 入口；lifespan 起停两个后台任务 + 释放 Redis/HTTP/engine
 │   ├── api/
 │   │   ├── deps.py                  # get_db / get_redis / get_document_service
 │   │   └── v1/
@@ -177,10 +219,10 @@ rag-ingest-pipeline/
 │   │   ├── logging.py
 │   │   └── exceptions.py            # 业务异常 + 统一处理器
 │   ├── db/                          # Base / engine / session / init_db
-│   ├── infra/redis_client.py
+│   ├── infra/                       # redis_client.py（Redis）/ model_client.py（模型服务的 HTTP 客户端）
 │   ├── models/
 │   │   ├── document_raw.py          # 原始文档体（留痕，清洗规则改了能重跑）
-│   │   ├── document_clean.py        # 标准化后的正文
+│   │   ├── document_clean.py        # 标准化后的正文（含 enrich_* 四列与状态机）
 │   │   ├── document_dedup.py        # 内容指纹表：content_hash 唯一
 │   │   └── document_chunk.py        # 分块：chunk_index / content / token_count / embedding_status
 │   ├── schemas/                     # DocumentCreate / DocumentOut / ChunkOut / BulkResult / StatsOut / Page
@@ -193,13 +235,23 @@ rag-ingest-pipeline/
 │   │   ├── lock_service.py          # 分布式锁（Lua 释放）
 │   │   ├── cache_service.py         # Cache-Aside + 版本号
 │   │   ├── task_service.py          # chunk 任务认领/完成（SKIP LOCKED）
-│   │   └── enrich_service.py        # AI 接缝（空实现）
-│   └── utils/                       # hashing / time
+│   │   ├── enrich_service.py        # AI 接缝的 facade：provider 分派 + 降级链（只做这两件事）
+│   │   ├── enrich_providers/        # 适配层：一个 provider 一个文件（厂商差异关在这里）
+│   │   │   ├── base.py              #   协议 + ENRICH_VERSION + EMPTY/OFF + 逐项降级
+│   │   │   ├── rule.py              #   纯 Python 四项（不出网；也是降级终点）
+│   │   │   ├── model.py             #   自定契约的上游（网关形态）
+│   │   │   └── openai_compat.py     #   OpenAI 兼容（自建 vLLM/Ollama 与云厂商兼容端点）
+│   │   ├── enricher.py              # 后台补 enrich 的循环（认领 → 补 → 写回）
+│   │   └── reclaimer.py             # 超时回收循环（chunk 的 processing + 文档的 enrich processing）
+│   └── utils/                       # hashing / time / language / summary / keywords / metadata / sample
+├── alembic/                         # 迁移（env.py 走异步 engine，DSN 取自 settings）
+│   └── versions/
 ├── syncer/                          # 同步器（模拟飞书/Confluence 批量推文档）
 ├── embedder/                        # 向量化 worker（认领 chunk → 标记完成）
+├── model/                           # 假模型服务（零依赖；enrich 的可插拔上游）
 ├── tests/
 ├── docs/
-├── docker-compose.yml               # api + mysql + redis + syncer + embedder
+├── docker-compose.yml               # api + mysql + redis + syncer + embedder + model
 ├── Dockerfile
 └── requirements.txt
 ```
@@ -212,31 +264,61 @@ rag-ingest-pipeline/
 |---|---|---|
 | `api/endpoints` | 定义路由、校验入参、返回响应 | 不写业务逻辑、不直接碰 DB |
 | `api/deps` | 组装依赖（session、redis、service） | — |
-| `services` | 业务编排（标准化→判重→落库→切块、任务分发、缓存、锁） | 不直接写 SQL；**不依赖 HTTP**（业务异常在 `core/exceptions.py` 统一映射） |
+| `services` | 业务编排（标准化→判重→落库→切块、任务分发、缓存、锁、enrich） | 不直接写 SQL；**不依赖 HTTP**（业务异常在 `core/exceptions.py` 统一映射。唯一的 HTTP 是调模型服务，被关在 `enrich_service.py` 一个模块里） |
 | `repositories` | 所有 DB 读写、聚合查询、`SKIP LOCKED` 认领 | 不含业务判断 |
 | `models` | ORM 表结构 | — |
 | `schemas` | 出入参的 Pydantic 模型 | — |
 | `core` | 配置、日志、异常 | — |
-| `infra` | 外部连接（Redis） | — |
+| `infra` | 外部连接（Redis 客户端、模型服务的 HTTP 客户端） | 不建连接池以外的逻辑；都是单例 + lifespan 释放 |
 | `utils` | 无状态的纯工具函数 | 无 IO、无全局状态 |
 
-数据流：`endpoint` → `service` → `repository` → `DB`；缓存/去重/锁走 `infra` 的 Redis。
+数据流：`endpoint` → `service` → `repository` → `DB`；缓存/去重/锁走 `infra` 的 Redis；
+调模型服务走 `infra` 的 HTTP 客户端（且只发生在**后台循环**里，不在请求路径上）。
 
 ---
 
 ## 快速开始
 
+> 目标：**5 分钟**从零到看见整条管道跑起来。每一步都写了"你应该看到什么"——
+> 对不上就去最后一步「卡住怎么办」里找。
+
+### 0. 前提
+
+- **Docker Desktop 已装好并在运行**（`docker version` 能打出 Server 段就对了）；
+- 第一次跑要构建镜像（装依赖 + 预热 tiktoken 词表与 jieba 词典），**会慢几分钟**，之后就快了；
+- **不需要在宿主机装 MySQL / Redis / Python** —— 这个项目只在容器里跑。
+
 ### 1. 准备配置
 ```bash
-cp .env.example .env      # 按需改数据库口令、端口
+cp .env.example .env      # 按需改数据库口令、库名、业务参数
 ```
 
-### 2. 起全套
+> **`.env` 里没有 host/port** —— 这个项目**只在容器里跑**，所以 MySQL/Redis 的地址一律是 compose 的服务名
+> （`mysql:3306` / `redis:6379`），只写在 `docker-compose.yml` 的 `environment:` 里。
+> **一份环境只描述一处**：`.env` 管账号、口令与业务参数，compose 管拓扑。
+
+### 2. 启动服务
 ```bash
 docker compose up -d --build
-docker compose ps         # 各服务应为 healthy / running
 ```
-浏览器打开 **http://localhost:8000/docs**。
+
+它会拉起**六个**服务：
+
+| 服务 | 是什么 |
+|---|---|
+| `api` | 本项目本体：FastAPI + 整条管道 |
+| `mysql` / `redis` | 数据库与缓存（去重快路径、分布式锁） |
+| `syncer` | 模拟**上游**：周期性批量推文档 |
+| `embedder` | 模拟**下游**：认领 chunk 做向量化 |
+| `model` | 假模型服务（enrich 的替身上游，默认那档用不到它） |
+
+**你应该看到**：
+
+```bash
+docker compose ps
+# api / mysql / redis        → healthy
+# syncer / embedder / model  → Up
+```
 
 > **表结构是怎么来的：** api 启动时会自动跑 `alembic upgrade head` —— 空库首启就把表建好，
 > 以后改 schema 再写一条迁移升上去即可，**不用再重建库、丢数据**。迁移文件在 `alembic/versions/`：
@@ -247,22 +329,48 @@ docker compose ps         # 各服务应为 healthy / running
 > （给一个**已有数据**的库首次引入迁移时，要先 `alembic stamp head` 打上版本戳，
 > 否则它会去建已经存在的表。）
 
-### 3. 手动发一篇
+### 3. 确认接口真的活着
+
 ```bash
-curl -s -w '\n%{http_code}\n' -X POST http://localhost:8000/api/v1/documents \
-  -H 'Content-Type: application/json' \
-  --data-binary '{"source":"feishu","external_id":"feishu-doc-001","title":"部署手册","content":"第一步…第二步…","url":"https://example.com/doc/1"}'
+# 从容器内部打 —— 本项目日常验证都走这条路，不依赖宿主机网络
+docker compose exec -T api python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health').status)"
+# 期望：200
 ```
 
-> 若宿主访问不通（Windows + WSL 的端口转发问题），改用 `docker compose exec` 从容器内部打——本项目日常验证走的就是这条路：
+再打开浏览器 **http://localhost:8000/docs** —— 能列出接口就说明通了。
+
+> ⚠️ **如果报 `service "api" is not running`**：说明栈根本没起来（重启过电脑、关过 Docker Desktop
+> 之后就是这样）。`docker compose up -d` 一下再回来 —— **这个错跟代码无关，别去改代码。**
+
+### 4. 发一篇文档
+
+两条路，挑一条：
+
+**a. 在浏览器里点（最省事）**：打开 http://localhost:8000/docs →
+`POST /api/v1/documents` → Try it out → `external_id` 填 `feishu-doc-001`、`content` 写几句 → Execute。
+**期望 201**；再点 `GET /api/v1/documents` 能看到刚发的那篇。
+
+**b. 用命令行**（JSON 放文件里 —— 原因见下面的警告）：
+
+```bash
+cat > /tmp/doc.json <<'JSON'
+{"source":"feishu","external_id":"feishu-doc-001","title":"部署手册","content":"第一步：准备环境。\n\n第二步：执行部署脚本。\n\n最后一步：验证健康检查通过。","url":"https://example.com/doc/1"}
+JSON
+curl -s -w '\n%{http_code}\n' -X POST http://localhost:8000/api/v1/documents \
+  -H 'Content-Type: application/json' --data-binary @/tmp/doc.json
+# 期望：末尾一行是 201
+```
+
+> ⚠️ **body 里带中文时，别把 JSON 内联进命令行参数** —— Windows 的 git bash 会把 argv 转成 GBK，
+> 服务端按 UTF-8 解析失败直接 400。**用 `--data-binary @文件`**（上面那样），或干脆走浏览器。
+
+> 若宿主访问不通（Windows + WSL 的端口转发问题），改用 `docker compose exec` 从容器内部打：
 
 ```bash
 docker compose exec -T api python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health').status)"
 ```
 
-> ⚠️ **body 里带中文时，别把 JSON 内联进命令行参数**——Windows 的 git bash 会把 argv 转成 GBK，服务端按 UTF-8 解析失败直接 400。用 `--data-binary @文件` 或 Python 客户端。
-
-### 4. 看完整流水线跑起来（本项目最有说服力的一幕）
+### 5. 看完整流水线跑起来（本项目最有说服力的一幕）
 ```bash
 docker compose up -d --scale syncer=2 --scale embedder=3
 
@@ -276,7 +384,74 @@ docker compose exec -T mysql mysql -uroot -proot123456 -e "
 ```
 期望：**同步器疯狂推、worker 并发认领不重复，`document_clean` 只有几行、chunk 状态从 `pending` 流向 `done`。**
 
-### 5. 跑测试
+### 6. 看 enrich 四档 —— 以及「上游挂了会怎样」
+
+```bash
+# 默认 rule：文档入库只标 pending，后台循环（默认 30 秒一轮）会把它补成 done
+docker compose exec -T mysql mysql -uroot -proot123456 -e "
+  select enrich_status, count(*) from rag_ingest.document_clean group by enrich_status;" 2>/dev/null
+
+# 切到 OpenAI 兼容档（假上游在 model 容器里，两个端点都讲）
+sed -i 's/^ENRICH_PROVIDER=.*/ENRICH_PROVIDER=openai_compat/' .env && docker compose up -d api
+# 发一篇文档 → 等后台补 → 摘要里会出现样本标记 [中间省略]，tags 是 2-gram（如 "者周"）——
+# 这两样规则侧都产不出来，所以"值是谁给的"一眼可辨
+
+# 铁律现场：把上游停掉，再发一篇 → 依然 201，那几列回落到规则算出来的值
+docker compose stop model
+docker compose up -d model          # 看完恢复
+sed -i '/^ENRICH_PROVIDER=/d' .env  # 删掉这行 —— 测试容器也读 .env，留着会让测试打到真上游
+```
+
+期望：`enrich_status` 从 `pending` 流向 `done`。
+**`ENRICH_PROVIDER=off` 时它会（刻意地）停在 `pending`** —— "待办积压"比"写一堆 NULL"更诚实，
+而且开关一打开它们还能被补上。
+
+### 7. 切到真厂商 API（以 DeepSeek 为例）
+
+> **先确认栈在跑**：`docker compose ps` 里 api 应该是 `healthy`；不在跑就先 `docker compose up -d`
+> —— 否则下面每条命令都只会报 `service "api" is not running`。
+
+`openai_compat` 那一档本来就是照着"云厂商兼容端点"设计的，所以**接真厂商不用改代码，只改配置**：
+
+```bash
+# .env（里面只有 key 需要你填；.env 已 gitignore）
+ENRICH_PROVIDER=openai_compat          # 先留 rule，等下面 Step 0 通过再切
+ENRICH_OPENAI_BASE_URL=https://api.deepseek.com
+ENRICH_OPENAI_PATH=/v1/chat/completions
+ENRICH_MODEL_NAME=deepseek-chat
+ENRICH_API_KEY=<你自己的 key>
+ENRICH_JSON_MODE=true
+ENRICH_TIMEOUT_SECONDS=20              # 默认 5 秒对云厂商太紧，而超时会"静默回落到规则"
+docker compose up -d api               # 必须重建容器，它才读得到新环境变量
+```
+
+**先隔离变量**：别一上来就走管道。先单独验一次厂商 API，确认 key / 网络 / 模型名 / 路径都对：
+
+```bash
+docker compose exec -T api python scripts/probe_upstream.py
+```
+
+它会先打出"将要用的配置"（请求地址 / 模型 / JSON 模式 / **key 配没配**），再发一次极小请求：
+
+- 通了 → 打印 `✓ 通了` + 模型 + 用量 + 内容；
+- 不通 → **直接打出上游自己的错误**（比如 `HTTP 401` + `Authentication Fails`），不是一段看不懂的 traceback。
+
+通了之后再切 `ENRICH_PROVIDER=openai_compat`，发一篇文档，等后台补完。**怎么确认"值来自模型、不是规则"**：
+
+- **最硬的证据是日志那一行**：`enrich(openai_compat, model=deepseek-chat) input=… output=… tokens`
+  —— 真 token 数，**规则档从不打这行**；
+- **摘要的形状**：规则侧只会拼"首段 + 尾段"的原文（带 `" … "` 分隔符）；模型给的是一句**转述**，
+  通常不带分隔符、也不是原文照抄；
+- 别再拿 `tags` 当判据 —— 模型给的词和 jieba 抽的**可能重合**（实测就撞过：都是"进程/线程/操作系统"）。
+  （`[中间省略]` 那个样本标记只在模型**照抄样本**时才出现；它爱转述，所以别只指望这个标记。）
+
+**降级是同一套**：把 key 改错 → 再发一篇 → 依然 `201`，几列回落到规则。
+
+> 换别家要动什么？多数只改 `ENRICH_OPENAI_BASE_URL` + `ENRICH_MODEL_NAME`（通义是 `…/compatible-mode`、
+> Kimi 是 `https://api.moonshot.cn`）；**智谱 GLM 的路径不同**，所以 `ENRICH_OPENAI_PATH` 才是可配的。
+> 细节与两个反直觉的坑见 [`docs/RAG数据接入与预处理管道项目疑问.md`](docs/RAG数据接入与预处理管道项目疑问.md) 的 **Q3 · 3.7**。
+
+### 8. 跑测试
 
 ```bash
 docker compose --profile test run --rm test
@@ -290,25 +465,47 @@ docker compose --profile test run --rm test
 > `tests/` 是**挂载**进测试容器的，改完测试直接重跑即可，不必 `--build`。
 > 生产镜像里没有 pytest（那是 `test` stage 才装的）—— 校验方式：`docker compose run --rm --no-deps api python -c "import pytest"` 应当报 `ModuleNotFoundError`。
 
+### 9. 卡住怎么办
+
+| 症状 | 先查这个 |
+|---|---|
+| `service "xxx" is not running` | 栈没起来 → `docker compose up -d`（重启电脑 / 关过 Docker Desktop 之后最常见） |
+| `port is already allocated`，8000 起不来 | 端口被占 → `netstat -ano \| findstr 8000` 找出占用者，或改 `docker-compose.yml` 的端口映射 |
+| api 一直 `unhealthy` / 反复重启 | `docker compose logs api --tail 50` —— 它自己会说原因（库连不上？迁移失败？） |
+| 浏览器打不开 `localhost:8000` | 见文末那条 Windows/WSL 说明；但**容器内部永远是通的**（第 3 步那条 `docker compose exec` 就是证据） |
+| 文档发了，但语言/摘要/关键词还是空的 | enrich 是**后台补**的：等 30 秒（一轮默认 30 秒），或 `docker compose logs api \| grep enrich` 看它在干嘛 |
+| 上游探活失败 | 脚本会打出上游的原始错误（401/400/超时），照着它说的改 `.env` |
+| 命令行查出来中文是 `????` | **不是数据坏了**：是 `mysql` **客户端**的会话字符集不是 utf8mb4（它按容器 locale 选）。compose 里已设 `LANG=C.UTF-8` 修掉了；哪天又遇到，临时加 `--default-character-set=utf8mb4` 即可。DBeaver 自己设了 utf8mb4，所以它一直正常 |
+
 ### 端口说明
-容器内 MySQL/Redis 是 3306/6379，**映射到宿主机 3307/6380**，避开本机已有的实例。容器内互连用服务名（`mysql:3306` / `redis:6379`）。
+
+容器内 MySQL/Redis 是 3306/6379。映射到宿主机的 **3307/6380 只给宿主机上的 GUI 工具用**
+（RedisInsight、DataGrip 之类，或临时 `mysql -h127.0.0.1 -P3307`），
+**应用自己永远走服务名**（`mysql:3306` / `redis:6379`）—— 这个项目只在容器里跑。
+所以日常验证也一律走容器内部（见第 3 步那条 `docker compose exec`）。
 
 ---
 
 ## 开发路线图
 
-改造分 5 段，每段独立可验证、可叫停（详见 [`docs/改造路线.md`](docs/改造路线.md)）：
+改造分 9 段，每段独立可验证、可叫停（详见 [`docs/改造路线.md`](docs/改造路线.md)）：
 
 - [x] **A** 全量换皮改名：article 域 → document 域（表 / 模型 / 服务 / 接口 / Redis 键）
 - [x] **B** 切块：新增 `document_chunk` 表 + 切块服务（段落优先 + overlap），管道接上切块
 - [x] **C** 异步任务分发：`/chunks/claim` + `/complete`（`SKIP LOCKED`），worker 可并发认领
 - [x] **D** 批量摄入 + 同步器 + worker 容器（`syncer` / `embedder`，可 `--scale`）
 - [x] **E** 叙事重写（README + 架构说明）+ 补齐自动化测试
+- [x] **F** 文档身份与版本：`document_source` 表 + 版本化（`superseded_at`）+ 告诉下游该撤回哪些
+- [x] **数据库大改** 内容去重改成「active 内容索引」+ 引入 Alembic（改 schema 不再重建库丢数据）
+- [x] **G** enrich 从空实现变成实的：语言 / 摘要 / 关键词 / 署名 + `enrich_version`
+- [x] **H** AI 可插拔：`ENRICH_PROVIDER = rule / model / off` + 后台补 + 假模型服务 + 降级链
+- [x] **H2** 适配层：provider 包（一个 provider 一个文件）+ **OpenAI 兼容**档 + 只发样本 + `max_tokens`
 
 ---
 
 ## 排错提醒
 
-服务起不来 / 页面一直转圈时，**先查端口占用和 python 进程**（Windows + `uvicorn --reload` 容易留孤儿 worker 占住端口），别先怀疑业务代码。停服务用 `Ctrl+C` 并等它退出，不要直接关终端窗口。
-
-另有一个 Windows 特有的坑：`localhost` 会优先解析到 `::1`，而 Docker 的端口转发若被 WSL 中继占住（`wslrelay.exe`），**宿主机会连不上容器**——但容器自己是好的（`docker compose exec` 里自测 200）。遇到时重启 Docker Desktop。
+- 常见症状与首查项，见上面 **「9. 卡住怎么办」** 的表格。
+- **Windows 特有的一个坑**：`localhost` 会优先解析到 `::1`，而 Docker 的端口转发若被 WSL 中继占住
+  （`wslrelay.exe`），**宿主机会连不上容器** —— 但容器自己是好的（`docker compose exec` 里自测 200）。
+  遇到时重启 Docker Desktop；或者干脆用容器内部验证（本项目的默认做法）。

@@ -1,7 +1,7 @@
 """
 文档仓储：对 document_clean 的读写集中在这里，只写「查询」，不含业务判断。
 
-阶段 F 起：document_clean **一行 = 一个版本** ，只有 `superseded_at IS NULL` 的那行是当前版本。
+阶段 F 起：document_clean **一行 = 一个版本** ，只有 ``superseded_at IS NULL`` 的那行是当前版本。
 所以所有「面向用户」的查询（列表 / 统计）都必须过滤掉历史版本。
 """
 from datetime import datetime
@@ -10,7 +10,7 @@ from sqlalchemy import Select, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.document_chunk import DocumentChunk
-from app.models.document_clean import DocumentClean
+from app.models.document_clean import DocumentClean, EnrichStatus
 from app.models.document_raw import DocumentRaw
 from app.models.document_source import DocumentSource
 from app.utils.time import utcnow
@@ -83,9 +83,9 @@ class DocumentRepo:
         """
         区间计数。
 
-        必须是范围写法：`fetched_at >= start AND fetched_at <= end` —— 这样能吃到
-        `fetched_at` 上的索引。写成 `func.date(fetched_at) == ...` 会对列做函数运算，
-        索引直接失效（且 MySQL 没有 `date_trunc`，那是 Postgres 的）。
+        必须是范围写法：``fetched_at >= start AND fetched_at <= end`` —— 这样能吃到
+        ``fetched_at`` 上的索引。写成 ``func.date(fetched_at) == ...`` 会对列做函数运算，
+        索引直接失效（且 MySQL 没有 ``date_trunc``，那是 Postgres 的）。
         """
         stmt = (
             select(func.count())
@@ -105,7 +105,7 @@ class DocumentRepo:
 
         一次 GROUP BY 拿全，而不是发三次 COUNT；状态就三种，结果最多三行。
 
-        **必须过滤已作废的块** ：作废时若它还停在 `pending`，这辈子都不会被认领，
+        **必须过滤已作废的块** ：作废时若它还停在 ``pending``，这辈子都不会被认领，
         却会被永远算成「积压」—— 积压数字就再也降不到 0 了。
         """
         stmt = (
@@ -122,11 +122,11 @@ class DocumentRepo:
         self, source: str, external_id: str, *, for_update: bool = False
     ) -> DocumentSource | None:
         """
-        取身份行。`for_update=True` 加行锁 —— 这是更新语义的 **权威** ：
+        取身份行。``for_update=True`` 加行锁 —— 这是更新语义的 **权威** ：
         把「读当前版本 → 写新版本」这段串行化。
 
         Redis 那把身份锁只负责「快速 409」这个体验优化；**真正保证不出现两个 active 版本的，
-        是这把行锁**（尤其 `bulk_ingest` 根本就没拿 Redis 锁）。
+        是这把行锁** （尤其 ``bulk_ingest`` 根本就没拿 Redis 锁）。
         """
         stmt = select(DocumentSource).where(
             DocumentSource.source == source,
@@ -162,6 +162,63 @@ class DocumentRepo:
             .where(DocumentClean.id == clean_id)
             .values(superseded_at=utcnow())
         )
+
+    # ---------- enrich 状态机（阶段 H）----------
+
+    async def claim_pending_enrich(self, limit: int) -> list[DocumentClean]:
+        """
+        认领一批「待补 enrich」的文档，置为 processing 并记下认领时刻。
+
+        和 ``chunk_repo.claim_pending`` 同一套路： **``SKIP LOCKED`` 让多实例各拿一批、互不重复**
+        （所以 ``--scale api`` 时多个进程各跑一个 enricher 循环也不会重复调模型）。
+        只认领 **当前版本** —— 历史版本没必要补。
+        """
+        stmt = (
+            select(DocumentClean)
+            .where(
+                DocumentClean.enrich_status == EnrichStatus.PENDING,
+                DocumentClean.superseded_at.is_(None),
+            )
+            .order_by(DocumentClean.id)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        rows = list((await self.db.execute(stmt)).scalars().all())
+        now = utcnow()
+        for row in rows:
+            row.enrich_status = EnrichStatus.PROCESSING
+            row.enrich_claimed_at = now
+        await self.db.commit()          # 提交才释放行锁
+        return rows
+
+    async def mark_enrich_done(self, clean_id: int, ai: dict) -> None:
+        """
+        写回 enrich 结果，并把状态推到 done。
+
+        ``ai`` 里 **允许全是 NULL** （provider=off，或模型与规则都失败）—— 那就写 NULL，
+        但状态照样推到 done：意思是" **试过了** "。
+        不这么做它就会一直留在 pending、每轮被重新认领一次 → **无限重试** （毒丸）。
+        """
+        await self.db.execute(
+            update(DocumentClean)
+            .where(DocumentClean.id == clean_id)
+            .values(enrich_status=EnrichStatus.DONE, **ai)
+        )
+        await self.db.commit()
+
+    async def reclaim_stale_enrich(self, older_than: datetime) -> int:
+        """把卡在 processing 太久（补它的进程挂了）的文档放回 pending，返回条数。"""
+        stmt = (
+            update(DocumentClean)
+            .where(
+                DocumentClean.enrich_status == EnrichStatus.PROCESSING,
+                DocumentClean.enrich_claimed_at < older_than,
+            )
+            .values(enrich_status=EnrichStatus.PENDING, enrich_claimed_at=None)
+        )
+        result = await self.db.execute(stmt)
+        await self.db.commit()
+        return result.rowcount or 0
 
     # ---------- 写入（阶段 5） ----------
 

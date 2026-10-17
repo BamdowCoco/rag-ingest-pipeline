@@ -4,6 +4,7 @@
 所以它们不需要 fixture。
 """
 from app.services.enrich_service import ENRICH_VERSION, enrich
+from app.services.enricher import enrich_once
 from app.utils.keywords import extract_keywords
 from app.utils.language import detect_language
 from app.utils.metadata import extract_author
@@ -122,21 +123,25 @@ async def test_enrich_fills_author_from_head_but_never_overwrites():
 
 async def test_enrich_degrades_item_by_item(monkeypatch):
     """语言挂了不该连累摘要 —— 逐项降级，各自留 NULL。"""
-    import app.services.enrich_service as mod
+    # 逐项降级的实现现在住在 provider 里（facade 只管分派），所以补丁打在那儿
+    import app.services.enrich_providers.rule as rule_mod
 
     def boom(_text: str) -> str:
         raise RuntimeError("语言检测炸了")
 
-    monkeypatch.setattr(mod, "detect_language", boom)
+    monkeypatch.setattr(rule_mod, "detect_language", boom)
 
-    out = await mod.enrich({"content": "一段足够长的正文，摘要应该照常生成出来。"}, {})
+    out = await enrich({"content": "一段足够长的正文，摘要应该照常生成出来。"}, {})
     assert out["language"] is None            # 挂掉的那项留空
     assert out["ai_summary"]                  # 另一项照常
     assert out["enrich_version"] == ENRICH_VERSION
 
 
-async def test_ingest_fills_language_summary_tags_and_author(client, make_doc):
-    """联机：POST 一篇带署名开头的多段中文 → 四列都有值，且摘要含尾段。"""
+async def test_enrich_is_filled_by_the_background_loop(client, make_doc):
+    """
+    联机：POST 之后 **响应里 enrich 字段还是 NULL** （异步补的必然），
+    跑一轮后台补之后才是实的 —— 这正好把阶段 H 的结构改动用测试钉住。
+    """
     doc = make_doc(
         source="feishu",
         external_id="enrich-1",
@@ -146,10 +151,19 @@ async def test_ingest_fills_language_summary_tags_and_author(client, make_doc):
             "最后一步：验证健康检查通过。"
         ),
     )
-    body = (await client.post("/api/v1/documents", json=doc)).json()
+    created = (await client.post("/api/v1/documents", json=doc)).json()
 
-    assert body["language"] == "zh"
-    assert body["ai_summary"]
-    assert "最后一步" in body["ai_summary"]     # 尾段确实进了摘要
-    assert body["author"] == "张三"
-    assert body["tags"]                         # 关键词落到了 tags
+    # ① 请求返回的那一刻：还没补（请求路径里不做 enrich）
+    assert created["language"] is None
+    assert created["ai_summary"] is None
+
+    # ② 跑一轮后台补（生产里由 enrich_loop 定时跑）
+    assert await enrich_once() == 1
+
+    # ③ 再查：全都有了
+    filled = (await client.get(f"/api/v1/documents/{created['id']}")).json()
+    assert filled["language"] == "zh"
+    assert filled["ai_summary"]
+    assert "最后一步" in filled["ai_summary"]     # 尾段确实进了摘要
+    assert filled["author"] == "张三"
+    assert filled["tags"]                         # 关键词落到了 tags

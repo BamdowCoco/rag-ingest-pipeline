@@ -19,13 +19,17 @@ RUN pip install --no-cache-dir -r requirements.txt \
 # 这里只拷 app/（不拷 .env：镜像里不留口令，配置由 compose 的 env_file/environment 注入）
 COPY app/ ./app/
 
+# 运维小工具（如 scripts/probe_upstream.py 单验上游）—— 拷进来就能 `docker compose exec` 直接跑，
+# 不必额外挂卷（api 有 container_name，`compose run` 会和在跑的容器抢名字）
+COPY scripts/ ./scripts/
+
 # 迁移：alembic 的配置 + 迁移脚本。lifespan 里要跑 `upgrade head`，所以必须在镜像里
 COPY alembic.ini .
 COPY alembic/ ./alembic/
 
 EXPOSE 8000
 
-# 不加 --reload：容器内不做热重载。想边写边跑，用宿主机 uvicorn（见 README「本地开发」）
+# 不加 --reload：容器内不做热重载。改完代码重建即可：docker compose up -d --build api
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
 

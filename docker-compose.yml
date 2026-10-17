@@ -1,8 +1,9 @@
-# 定义多容器 Docker 应用：api + mysql + redis + syncer + embedder
-# 用法：docker compose up -d  →  docker compose ps（基础三个 healthy）→  http://localhost:8000/docs
-#      再看完整流水线：docker compose up -d --scale syncer=2 --scale embedder=3
+# 定义多容器 Docker 应用：api + mysql + redis + syncer + embedder + model
+# 起法：docker compose up -d --build  →  docker compose ps（详见 README「快速开始」）
+#      看完整流水线：docker compose up -d --scale syncer=2 --scale embedder=3
 #
-# 端口：容器内 mysql/redis 是 3306/6379，映射到宿主机 3307/6380，避开本机可能已在跑的实例
+# 端口：容器内 mysql/redis 是 3306/6379。宿主机映射到 3307/6380 —— 只给宿主机上的 GUI 工具用
+#      （应用自己永远走服务名，见下面 api 的 environment）；避开本机可能已在跑的实例。
 services:
   # ---------- FastAPI 应用 ----------
   api:
@@ -14,17 +15,18 @@ services:
     container_name: rag-api
     ports:
       - "8000:8000"
-    # 先用 env_file 把 .env 灌进去（里面是「本地口径」）
+    # env_file 只提供账号 / 口令 / 业务参数（.env 里没有 host/port）
     env_file:
       - .env
-    # 再用 environment 覆盖 host/port 成「容器内口径」—— 这正演示了「同代码、异环境」
-    # 优先级：environment > env_file，所以下面这几行会盖掉 .env 里的同名项
+    # host/port 的唯一口径在这里：项目只在 compose 里跑，所以应用连的一律是服务名。
+    # （一份环境只描述一处 —— 以前 .env 里那套本地 localhost:3307 已删掉）
     environment:
       DB_HOST: mysql
       DB_PORT: 3306
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_DB: 0
+      ENRICH_MODEL_URL: "http://model:8000/enrich"   # enrich 走模型服务时去哪儿调
     depends_on:
       # service_healthy：等对方健康检查通过再启动，防止应用崩溃
       mysql:
@@ -38,6 +40,14 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    restart: unless-stopped
+    networks: [backend]
+
+  # ---------- 假模型服务（enrich 的"上游"；ENRICH_PROVIDER=model 时才真的会被调到）----------
+  # 【故意不写 depends_on】api 不依赖它启动 —— 它挂了正好用来验证降级链：
+  # enrich 会回落到规则、入库照样成功。这就是"外部依赖不能拦住主流程"的现场。
+  model:
+    build: ./model
     restart: unless-stopped
     networks: [backend]
 
@@ -86,6 +96,10 @@ services:
       REDIS_PORT: 6379
       REDIS_DB: "15"               # 独享 redis db 号（生产是 0）；清库只用 flushdb 不用 flushall
       DB_ROOT_PASSWORD: root123456 # 建 rag_ingest_test 要 root 权限（app 用户没这个库的权限）
+      # 【测试绝不打真上游】哪怕 .env 里切成 openai_compat（联机验收时会那么切），测试也一律走规则 ——
+      # 否则一条"逐项降级"的纯函数单测会真去调厂商 API（花真钱）。这个坑踩过一次了。
+      ENRICH_PROVIDER: rule
+      ENRICH_API_KEY: ""           # 顺便把真 key 挡在测试容器外
     depends_on:
       mysql:
         condition: service_healthy
@@ -106,11 +120,16 @@ services:
       MYSQL_DATABASE: rag_ingest           # 对应 .env 的 DB_NAME
       MYSQL_USER: app                   # 对应 DB_USER
       MYSQL_PASSWORD: app               # 对应 DB_PASSWORD
+      # 【为什么要有 LANG】mysql 客户端按 OS locale 选会话字符集；容器里不设 locale 它会退回 latin1，
+      # 于是把中文转成 latin1 再发出来 —— 表示不了的字符直接变 `?`（有损，不是显示问题）。
+      # 服务端与 app 侧本来就是 utf8mb4（见下面的 command 与 DSN 的 charset），只有命令行客户端会中招。
+      # 设了它，`docker compose exec mysql mysql ...` 就不必每次带 --default-character-set=utf8mb4 了。
+      LANG: C.UTF-8
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
     ports:
-      - "3307:3306"                     # 宿主机 3307 → 容器 3306
+      - "3307:3306"                     # 只给宿主机 GUI 工具；应用走服务名 mysql:3306
     volumes:
       - mysql_data:/var/lib/mysql       # 命名卷：容器删了数据还在
     healthcheck:
@@ -129,7 +148,7 @@ services:
     container_name: rag-redis
     command: ["redis-server", "--appendonly", "yes"]   # 开 AOF 持久化
     ports:
-      - "6380:6379"                     # 宿主机 6380 → 容器 6379
+      - "6380:6379"                     # 只给宿主机 GUI 工具；应用走服务名 redis:6379
     volumes:
       - redis_data:/data
     healthcheck:

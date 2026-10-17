@@ -1,15 +1,29 @@
 """标准化后正文：管道第二站，存标准化（去 HTML / 全角转半角 / 折叠空白…）后的结果。
 
 **一行 = 一个版本** ，不是一篇文档 —— 同一篇文档更新后会有多行，其中只有一行是
-当前版本（`superseded_at IS NULL`）。身份在 `document_source`。
+当前版本（``superseded_at IS NULL``）。身份在 ``document_source``。
 """
 from datetime import datetime
+from enum import StrEnum
 
 from sqlalchemy import JSON, DateTime, ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
 from app.utils.time import utcnow
+
+
+class EnrichStatus(StrEnum):
+    """
+    文档 enrich 的状态机：pending → processing → done。
+
+    和 ``document_chunk.embedding_status`` **同一个形状** —— 因为 enrich 现在也是
+    **后台补的活** ：模型调用是秒级的 **外部依赖** ，不能压在请求路径里（见 ``services/enricher.py``）。
+    """
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    DONE = "done"
 
 
 class DocumentClean(Base):
@@ -50,5 +64,13 @@ class DocumentClean(Base):
     ai_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     language: Mapped[str | None] = mapped_column(String(8), nullable=True)
     # 用哪一版规则 enrich 的（对齐 clean_version）—— 规则改了，得知道哪些行该重跑。
-    # 可空是为了将来 provider=off 时能写 NULL（表示"没做过"），与"做了但都是空"区分开。
+    # 可空是为了 provider=off 时能写 NULL（表示"没做过"），与"做了但都是空"区分开。
     enrich_version: Mapped[int | None] = mapped_column(nullable=True)
+    # enrich 的状态机：落库时 pending → 后台循环认领置 processing → 补完置 done。
+    # pending 就是「待补的积压」，和 chunk 的 pending 一个意思。
+    enrich_status: Mapped[str] = mapped_column(
+        String(16), default=EnrichStatus.PENDING, index=True, nullable=False
+    )
+    # 认领时刻 —— 用于把卡住的 processing 放回 pending（补它的进程挂了）。
+    # 这张表本来就"写后不变"，所以不给它加通用的 updated_at，只加这一个专用的时间戳。
+    enrich_claimed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
