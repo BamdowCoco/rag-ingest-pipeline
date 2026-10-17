@@ -9,7 +9,7 @@ import hashlib
 
 
 def make_content_hash(title: str, content: str) -> str:
-    """
+    r"""
     sha256(标题 + "\n" + 正文) 的十六进制串（64 字符，正好对应 content_hash 列）。
 
     中间那个 "\n" 是分隔符：否则 ("ab", "c") 与 ("a", "bc") 会撞成同一个哈希。

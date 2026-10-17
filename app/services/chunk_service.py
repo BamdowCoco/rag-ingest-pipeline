@@ -4,14 +4,14 @@
 **尺寸用 token 精确控制** —— 不是字符、也不是估算。下游受约束的就是 token。
 
 策略：递归字符分割（Recursive Character Splitting），从「最自然的边界」往下降级：
-  ① 段落 `\n\n`     一段话装得下就整段成块
-  ② 句子 `。！？；`  段落超限才退到这一级，尽量把完整句子装进预算
+  ① 段落 ``\\n\\n``     一段话装得下就整段成块
+  ② 句子 ``。！？；``  段落超限才退到这一级，尽量把完整句子装进预算
   ③ 单字符         句子还超限（罕见）才硬切 —— 到这一级是 **按 token 切** 的
 
-【将来】若切块参数需要反复试，就该像 `clean_version` 那样给 chunk 记一个
-`chunker_version` —— 否则无法知道哪些块是用旧参数切的、该不该重切。
+【将来】若切块参数需要反复试，就该像 ``clean_version`` 那样给 chunk 记一个
+``chunker_version`` —— 否则无法知道哪些块是用旧参数切的、该不该重切。
 """
-from app.utils.tokenizer import count_tokens, enc
+from app.utils.tokenizer import count_tokens, decode_tokens, enc
 
 CHUNK_SIZE = 512                                  # 目标块大小，单位：token
 OVERLAP_RATIO = 0.125                             # 相邻块重叠比例（经验区间 10%~15%）
@@ -30,7 +30,8 @@ def _split_keeping_sep(text: str, sep: str) -> list[str]:
 def _hard_split_tokens(text: str, size: int) -> list[str]:
     """退无可退：按 **token** 硬切（encode → 切片 → decode）。"""
     ids = enc.encode(text)
-    return [enc.decode(ids[i:i + size]) for i in range(0, len(ids), size)]
+    # decode 必须走 decode_tokens：切片会切在多字节字符中间，直接 decode 会填 `�`（见那个函数的说明）
+    return [decode_tokens(ids[i:i + size]) for i in range(0, len(ids), size)]
 
 
 def _split_recursive(text: str, size: int, separators: list[str]) -> list[str]:
@@ -63,7 +64,9 @@ def _token_tail(text: str, n_tokens: int) -> str:
     ids = enc.encode(text)
     if len(ids) <= n_tokens:
         return text                     # 整块都不到 n_tokens，就整块给它
-    return enc.decode(ids[-n_tokens:])
+    # 同样走 decode_tokens：这一刀最容易切在汉字中间 —— 而它取的文本会成为下一块的开头，
+    # 那个 `�` 会直接出现在下一块的第一个字符上（当初就是这么被发现的）
+    return decode_tokens(ids[-n_tokens:])
 
 
 def _merge(pieces: list[str], size: int, overlap: int) -> list[str]:

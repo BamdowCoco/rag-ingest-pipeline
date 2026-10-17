@@ -2,7 +2,7 @@
 import pytest
 
 from app.services.chunk_service import CHUNK_OVERLAP, CHUNK_SIZE, make_chunks, split_text
-from app.utils.tokenizer import count_tokens
+from app.utils.tokenizer import count_tokens, decode_tokens, enc
 
 
 def test_empty_returns_no_chunks():
@@ -27,6 +27,31 @@ def test_adjacent_chunks_overlap():
     parts = split_text("这是完整的一句话。" * 100)
     assert len(parts) > 1
     assert parts[0][-20:] in parts[1]
+
+
+def test_token_slicing_never_leaves_replacement_chars():
+    """
+     **按 token 切片会切在多字节字符中间** —— 不能把 ``�``（U+FFFD）写进块里。
+
+    真事：一篇长中文文档的某一块 **开头** 出现过 ``�``（见 ``docs/问题记录.md``）。
+    根因是 tiktoken 的 ``decode`` 对 **不完整的 UTF-8 序列** 默认填替换字符，
+    而切块有两处按 token 切（overlap 取尾、无分隔符时硬切）—— 两条路都覆盖。
+
+     **下面这组参数是实测会复现的** （当年就是这种形状）：换掉就可能抓不住了。
+    """
+    sentence = "进程：由于各个进程间相互隔离，一个进程的崩溃并不会影响到其他的进程的稳定性。"
+
+    # ① 走 overlap 那条路：上一块尾部被切成下一块的开头
+    parts = split_text(sentence * 11, size=32, overlap=12)
+    assert len(parts) > 1
+    assert "�" not in "".join(parts)
+
+    # ② 走硬切那条路：完全没有分隔符的长串
+    assert "�" not in "".join(split_text("中" * 400, size=32, overlap=8))
+
+    # ③ 机制本身：对一个"会切坏"的 token 切片解码，也不该带出替换字符
+    ids = enc.encode(sentence)
+    assert "�" not in decode_tokens(ids[-12:])
 
 
 def test_paragraph_boundary_preferred():

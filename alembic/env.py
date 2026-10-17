@@ -3,11 +3,11 @@ Alembic 环境（ **异步** 版）。
 
 两点和默认模板不同：
 
-1. **DSN 从 app 的 `settings` 取** ，不写在 `alembic.ini` 里 ——
-   这样迁移连的库和应用连的库 **永远是同一个** （容器里是 `mysql`、本地是 `localhost`，
-   靠环境变量切，不会错位）。
-2. 用 **async engine** （项目是 aiomysql）—— 所以走 `connection.run_sync(...)`
-   把同步的 `context.run_migrations()` 丢进去跑。
+1. **DSN 从 app 的 ``settings`` 取** ，不写在 ``alembic.ini`` 里 ——
+   这样迁移连的库和应用连的库 **永远是同一个** （都从 compose 注入的服务名 ``mysql:3306`` 来，
+   不靠人记、也不会错位）。
+2. 用 **async engine** （项目是 aiomysql）—— 所以走 ``connection.run_sync(...)``
+   把同步的 ``context.run_migrations()`` 丢进去跑。
 """
 import asyncio
 from logging.config import fileConfig
@@ -19,11 +19,20 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 import app.models  # noqa: F401  —— 只为一个副作用：把五张表注册进 Base.metadata
 from app.core.config import settings
+from app.core.logging import is_configured as logging_is_configured
 from app.db.base import Base
 
 config = context.config
 
-if config.config_file_name is not None:
+# 【为什么这里要分情况】`fileConfig` 不是"加一个 handler"，它是按 alembic.ini
+# 重建根 logger：root 级别设成 WARNING、并把已有的 logger 全 禁用
+# （`disable_existing_loggers` 默认就是 True）。
+# 命令行里独立跑 `alembic upgrade` 时这正好合适 —— 迁移自己的日志够用、也不吵；
+# 但 lifespan 是在 应用进程内 调 upgrade 的（见 app/main.py），
+# 那时应用刚配好的日志会被整个顶掉：启动之后自己的 INFO 日志全部静默消失，
+# 连 "后台任务已启动" 这种话都看不到 —— 排查时最要命。
+# 所以只在 "应用还没配过日志"（= 独立跑迁移）时才套 alembic.ini。
+if config.config_file_name is not None and not logging_is_configured():
     fileConfig(config.config_file_name)
 
 # configparser 会把 % 当插值符 —— DSN 里若有 % （比如口令）要先转义

@@ -2,9 +2,10 @@
 日志配置
 
 用标准库 logging：给根 logger 挂一个控制台 handler。
-- 级别从 settings.log_level 取（.env 里 LOG_LEVEL=INFO）
-- 统一格式：时间 | 级别 | logger名 | 消息
-- 输出到 stdout（容器里 `docker logs` 才能收到；不要打在 stderr 之外的地方）
+
+ - 级别从 settings.log_level 取（.env 里 LOG_LEVEL=INFO）
+ - 统一格式：时间 | 级别 | logger名 | 消息
+ - 输出到 stdout（容器里 ``docker logs`` 才能收到；不要打在 stderr 之外的地方）
 
 用法：在 app/main.py 顶部调用一次 setup_logging()，之后各模块
     logger = logging.getLogger(__name__)
@@ -20,6 +21,16 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 # 模块级标志：保证只配置一次
 _configured = False
+
+
+def is_configured() -> bool:
+    """
+    ``setup_logging`` 跑过没有。
+
+    给 ``alembic/env.py`` 判断用的：它知道自己是在 **应用进程内** 被调起来的
+    （lifespan 跑 upgrade），还是在命令行里独立跑的 —— 前者绝不能再去套 alembic.ini。
+    """
+    return _configured
 
 
 def setup_logging(level: str | None = None) -> None:
