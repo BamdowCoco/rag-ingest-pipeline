@@ -1,7 +1,7 @@
 """
 内容索引仓储：document_dedup 的读写。
 
-准入的 **权威** 就在这张表上（`content_hash` 唯一索引），仓储只管读写、不做业务判断。
+准入的 **权威** 就在这张表上（``content_hash`` 唯一索引），仓储只管读写、不做业务判断。
 """
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession

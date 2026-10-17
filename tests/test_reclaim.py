@@ -1,4 +1,4 @@
-"""超时回收：卡在 `processing` 太久的块回到 `pending`。"""
+"""超时回收：卡在 ``processing`` 太久的块回到 ``pending``。"""
 from datetime import timedelta
 
 from sqlalchemy import update

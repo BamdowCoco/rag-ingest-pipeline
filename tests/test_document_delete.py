@@ -28,7 +28,7 @@ async def test_delete_unknown_identity_is_not_404(client):
 
 
 async def test_deleted_document_can_be_resurrected(client, make_doc):
-    """源系统删过、又推回来 → 复活（而不是撞 `UNIQUE(source, external_id)`）。"""
+    """源系统删过、又推回来 → 复活（而不是撞 ``UNIQUE(source, external_id)``）。"""
     doc = make_doc(source="feishu", external_id="res-1")
 
     await client.post("/api/v1/documents", json=doc)

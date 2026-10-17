@@ -1,8 +1,8 @@
 """
 异步建表
 
-关键：base.py 不认识任何模型，必须靠这里 `import app.models` 把三张表「注册」进
-Base.metadata，`create_all` 才知道要建哪些表。少了这行 import，metadata 是空的，
+关键：base.py 不认识任何模型，必须靠这里 ``import app.models`` 把三张表「注册」进
+Base.metadata，``create_all`` 才知道要建哪些表。少了这行 import，metadata 是空的，
 create_all 会一个表都不建（而且不报错，很容易一头雾水）。
 """
 from app.db.base import Base

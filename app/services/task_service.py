@@ -8,10 +8,10 @@
     POST /api/v1/chunks/{id}/complete  → 回报完成
 
 为什么用 DB 当队列、而不引 Redis/消息队列：本项目的数据量级不需要；
-而 `SKIP LOCKED` 恰好提供了「多个 worker 各拿一批、互不重复」的语义。
+而 ``SKIP LOCKED`` 恰好提供了「多个 worker 各拿一批、互不重复」的语义。
 真上规模时再换 MQ/RabbitMQ，接口形状可以不变。
 
-注意： **超时回收不在这里** ，它是个独立的后台循环（`reclaimer.py`）—— 为什么拆出去，
+注意： **超时回收不在这里** ，它是个独立的后台循环（``reclaimer.py``）—— 为什么拆出去，
 见那个文件的说明。
 """
 import logging
@@ -40,8 +40,8 @@ class TaskService:
         """
         认领一批「要下游把向量删掉」的块。
 
-        注意它和 `claim` **不是一回事** ：撤回没有 in-flight 状态，多个 worker 可能拿到同一批
-        （删向量是幂等的）—— 详细取舍见 `chunk_repo.claim_retractions`。
+        注意它和 ``claim`` **不是一回事** ：撤回没有 in-flight 状态，多个 worker 可能拿到同一批
+        （删向量是幂等的）—— 详细取舍见 ``chunk_repo.claim_retractions``。
         """
         rows = await self.repo.claim_retractions(limit)
         if rows:
@@ -66,7 +66,7 @@ class TaskService:
         """
         回报「该向量已从向量库删掉」。id 不存在、或已经确认过 → 404。
 
-        `mark_done` 那条注释同样适用：Core update() 绕过 ORM，取之前要先 `expire_all()`。
+        ``mark_done`` 那条注释同样适用：Core update() 绕过 ORM，取之前要先 ``expire_all()``。
         """
         if not await self.repo.mark_retracted(chunk_id):
             logger.info("回报撤回失败：chunk 不存在或已确认过 id=%s", chunk_id)

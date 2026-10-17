@@ -2,10 +2,11 @@
 模拟向量化 worker：认领 chunk → （模拟）embedding 调用 → 上报完成。
 
 要点：
-- 用 `/chunks/claim` 认领（`SKIP LOCKED`，多实例并发认领不会拿到同一条）
-- 每条之间 sleep 一下，模拟 embedding 这种【秒级外部调用】—— 这正是
-  「一次同步几千篇、同步等不可行」的由来，也是任务分发的意义
-- 一个进程复用一个 `httpx.AsyncClient`
+
+ - 用 ``/chunks/claim`` 认领（``SKIP LOCKED``，多实例并发认领不会拿到同一条）
+ - 每条之间 sleep 一下，模拟 embedding 这种【秒级外部调用】—— 这正是
+   「一次同步几千篇、同步等不可行」的由来，也是任务分发的意义
+ - 一个进程复用一个 ``httpx.AsyncClient``
 """
 import asyncio
 import logging

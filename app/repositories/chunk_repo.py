@@ -1,13 +1,13 @@
 """
 分块仓储：认领 / 完成 / 回收 —— 阶段 C 的任务分发。
 
-这里用 MySQL 的行锁做「极简任务队列」：`SELECT ... FOR UPDATE SKIP LOCKED`。
+这里用 MySQL 的行锁做「极简任务队列」：``SELECT ... FOR UPDATE SKIP LOCKED``。
 它和分布式锁的分工正好形成对照：
 
     锁（Redis）          = 这件事只能一个人做（保护临界区）
     SKIP LOCKED（MySQL） = 这堆活大家分着做（分发任务）
 
-`SKIP LOCKED` 让每个 worker 拿到 **不同的那一批** ，天然不重复。
+``SKIP LOCKED`` 让每个 worker 拿到 **不同的那一批** ，天然不重复。
 """
 from datetime import datetime
 
@@ -86,7 +86,7 @@ class ChunkRepo:
         """
         作废某个版本的全部块，返回条数。
 
-        故意 **不动 `retracted_at`** —— 哪些块需要下游撤回，交给 `claim_retractions`
+        故意 **不动 ``retracted_at``** —— 哪些块需要下游撤回，交给 ``claim_retractions``
         按「已 done 且未 retracted」自己筛。于是「作废时还停在 pending 的块不用撤回」
         （下游从没见过它）这件事 **自动成立** ，不用在这里特判。
         """
@@ -108,7 +108,7 @@ class ChunkRepo:
         **它和补齐流不一样：这里没有 in-flight 状态。** 因为删向量是 **幂等** 的
         （同一个向量删两次没差别），所以允许多个 worker 拿到同一批、下游重复删 ——
         换来的是「worker 崩了任务也不会静默丢失，下一轮自然重试」。
-        也就是说它 **不共享** `SKIP LOCKED` 的「各拿一批」语义，这是刻意的取舍。
+        也就是说它 **不共享** ``SKIP LOCKED`` 的「各拿一批」语义，这是刻意的取舍。
 
         只在 **已 done** 的块上产生任务：没被认领过的 pending 块压根没向量可删。
         """

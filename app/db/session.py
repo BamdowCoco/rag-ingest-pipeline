@@ -40,7 +40,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
     请求级依赖：给每个请求一个 AsyncSession，请求结束自动关闭；出错则回滚。
     用法：db: AsyncSession = Depends(get_db)
 
-    （阶段 3 会在 app/api/deps.py 里 `from app.db.session import get_db` 再转出去，
+    （阶段 3 会在 app/api/deps.py 里 ``from app.db.session import get_db`` 再转出去，
       依赖注入链末端用它；这里先作为规范来源。）
     """
     async with AsyncSessionLocal() as session:

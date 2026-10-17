@@ -18,7 +18,7 @@ def split_paragraphs(text: str) -> list[str]:
 
 def summarize(text: str, *, limit: int = DEFAULT_LIMIT) -> str | None:
     """
-    首段 + 尾段，合并后截断到 `limit` 字； **空文本 → None** 。
+    首段 + 尾段，合并后截断到 ``limit`` 字； **空文本 → None** 。
 
     只有一段时就取它自己 —— 否则会拼出"首段 … 尾段"这种和原文一模一样的东西。
     """

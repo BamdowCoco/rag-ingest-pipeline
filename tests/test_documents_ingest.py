@@ -17,8 +17,8 @@ async def test_normalize_before_hash(client, make_doc):
     """
     同一篇内容、不同的原始空白 → 判为重复。
 
-    这正是「必须先标准化、后哈希」的证据：不先标准化，`"标题"` 与 `" 标题 "`、
-    `"第一步    第二步"` 与 `"第一步 第二步"` 会算出 **两个不同的 hash** ，判重直接失效。
+    这正是「必须先标准化、后哈希」的证据：不先标准化，``"标题"`` 与 ``" 标题 "``、
+    ``"第一步    第二步"`` 与 ``"第一步 第二步"`` 会算出 **两个不同的 hash** ，判重直接失效。
     """
     r1 = await client.post(
         "/api/v1/documents",
@@ -47,7 +47,7 @@ async def test_missing_required_field_is_422(client):
 
 async def test_external_id_is_required(client, make_doc):
     """
-    阶段 F 起 `external_id` **必填** —— 它就是「文档身份」。
+    阶段 F 起 ``external_id`` **必填** —— 它就是「文档身份」。
     没有它，系统分不清「同一篇改过了」和「这是新的一篇」。
     """
     doc = make_doc()

@@ -1,6 +1,6 @@
 """
 依赖注入：把 db / redis / service 组装起来。
-endpoint 只写 `service: DocumentService = Depends(get_document_service)`，不碰 session/redis。
+endpoint 只写 ``service: DocumentService = Depends(get_document_service)``，不碰 session/redis。
 """
 from fastapi import Depends
 from redis.asyncio import Redis

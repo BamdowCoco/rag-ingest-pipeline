@@ -2,9 +2,10 @@
 Redis 客户端（redis.asyncio）
 
 和 14/17 课的 redis_client.py 基本一致，差别有三：
-- URL 来自 settings.redis_url（同样靠环境变量切本地/容器）
-- 加了 health_check_interval，空闲连接定期探活
-- 额外提供 close_redis()，供 main.py 的 lifespan 关停时释放连接池
+
+ - URL 来自 settings.redis_url（同样靠环境变量切本地/容器）
+ - 加了 health_check_interval，空闲连接定期探活
+ - 额外提供 close_redis()，供 main.py 的 lifespan 关停时释放连接池
 """
 from collections.abc import AsyncGenerator
 

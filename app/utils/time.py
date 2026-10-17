@@ -18,7 +18,7 @@ def day_range(d: date) -> tuple[datetime, datetime]:
     返回某天的 [00:00:00, 23:59:59.999999]（naive UTC）。
 
     统计「今日新增」时用范围查询：fetched_at >= start AND fetched_at <= end，
-    比 `DATE(fetched_at) = ?` 好 —— 后者会让 fetched_at 上的索引失效。
+    比 ``DATE(fetched_at) = ?`` 好 —— 后者会让 fetched_at 上的索引失效。
     """
     return datetime.combine(d, time.min), datetime.combine(d, time.max)
 
@@ -34,6 +34,7 @@ def beijing_today_utc_range() -> tuple[datetime, datetime]:
     例：北京 2026-10-14 的一整天
         = 北京 00:00:00 ~ 23:59:59.999999
         = UTC  2026-10-13 16:00:00 ~ 2026-10-14 15:59:59.999999
+
     别直接用 UTC 的「今天」—— 那会比北京日期差 8 小时。
     """
     today_bj = datetime.now(BEIJING_TZ).date()

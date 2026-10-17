@@ -3,7 +3,7 @@
 
 GET 列表 / GET 单篇走 Cache-Aside（阶段 7）；POST 走完整管道（标准化→加锁→判重→入库）。
 阶段 D：新增 POST /bulk 批量入口；单篇重复从 409 改为 200（「重复不是错误」）。
-阶段 F：带 `external_id` 的文档走身份判断（同 id 内容变了 = 更新）；新增 POST /delete 删除信号。
+阶段 F：带 ``external_id`` 的文档走身份判断（同 id 内容变了 = 更新）；新增 POST /delete 删除信号。
 """
 from fastapi import APIRouter, Depends, Path, Query, Response, status
 

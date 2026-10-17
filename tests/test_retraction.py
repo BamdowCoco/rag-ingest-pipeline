@@ -34,7 +34,7 @@ async def test_retraction_only_for_already_embedded_chunks(client, make_doc):
 
 
 async def test_no_retraction_for_chunks_never_claimed(client, make_doc):
-    """作废时还停在 `pending` 的块 —— 下游从没见过它 → 不该有撤回任务。"""
+    """作废时还停在 ``pending`` 的块 —— 下游从没见过它 → 不该有撤回任务。"""
     first = make_doc(source="feishu", external_id="ret-2", content="旧版正文")
     await client.post("/api/v1/documents", json=first)
     # 故意【不认领】，直接更新

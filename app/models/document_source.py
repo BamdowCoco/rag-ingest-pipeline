@@ -1,11 +1,11 @@
 """
 文档身份表：一个 **源文档** 一行 —— 它回答的是「这是不是同一篇」。
 
-**为什么必须单独一张表：** `document_clean` 上一个 `external_id` 会有 **多行版本**
-（每次更新都新增一行），所以 `UNIQUE(source, external_id)` 根本没地方建。
+**为什么必须单独一张表：** ``document_clean`` 上一个 ``external_id`` 会有 **多行版本**
+（每次更新都新增一行），所以 ``UNIQUE(source, external_id)`` 根本没地方建。
 「身份」和「版本」是两件事 —— 一张表装不下。这正是本段要解决的那个诊断。
 
-同步器侧的 `external_id` 就是飞书 / Confluence 的文档 ID， **必填** ——
+同步器侧的 ``external_id`` 就是飞书 / Confluence 的文档 ID， **必填** ——
 它就是「文档身份」；没有身份，系统分不清"同一篇改过了"和"这是一篇新文档"。
 """
 from datetime import datetime

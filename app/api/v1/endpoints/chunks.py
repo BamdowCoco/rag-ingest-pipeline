@@ -2,9 +2,9 @@
 向量化任务的认领与回报（阶段 C）—— 给下游 worker 调的。
 阶段 F 起同一个认领接口 **多返回一类任务** ：撤回（把过时向量从向量库删掉）。
 
-注意路径顺序：`/chunks/claim`（两段）与 `/chunks/{chunk_id}/complete`（三段）
-段数不同，不会互相遮蔽。但 **将来若加 `/chunks/{chunk_id}`，必须注册在 `/claim` 之后**
-—— 就是阶段 7 那个 `/{id}` 吃 `/stats` 的同类坑。
+注意路径顺序：``/chunks/claim`` （两段）与 ``/chunks/{chunk_id}/complete`` （三段）
+段数不同，不会互相遮蔽。但 **将来若加 ``/chunks/{chunk_id}``，必须注册在 ``/claim`` 之后**
+—— 就是阶段 7 那个 ``/{id}`` 吃 ``/stats`` 的同类坑。
 """
 from fastapi import APIRouter, Depends, Path
 

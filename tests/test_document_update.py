@@ -1,4 +1,4 @@
-"""更新语义（阶段 F）：同一个 `external_id` 内容变了 → **更新** （新版本 + 旧版本作废），而不是新增一篇。"""
+"""更新语义（阶段 F）：同一个 ``external_id`` 内容变了 → **更新** （新版本 + 旧版本作废），而不是新增一篇。"""
 import json
 
 from sqlalchemy import select
@@ -66,9 +66,9 @@ async def test_same_content_under_a_different_identity_is_rejected_as_duplicate(
     """
     **跨源转载** ：同一份内容从另一个源推过来 → 被「准入检查」拦下，指向已有那篇。
 
-    这是内容去重（Redis 快路径 + `document_dedup` 唯一索引）的正面例子 ——
-    内容唯一性与"文档身份"是 **两件事** ：身份由 `(source, external_id)` 回答，
-    内容由 `content_hash` 回答。
+    这是内容去重（Redis 快路径 + ``document_dedup`` 唯一索引）的正面例子 ——
+    内容唯一性与"文档身份"是 **两件事** ：身份由 ``(source, external_id)`` 回答，
+    内容由 ``content_hash`` 回答。
     （阶段 F 之前这条走的是"没有身份"那条路，现在挪到了「新建准入」。）
     """
     first = make_doc(source="feishu", external_id="a-1", title="同名标题", content="一模一样的正文")

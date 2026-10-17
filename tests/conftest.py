@@ -5,13 +5,15 @@
     docker compose --profile test run --rm test
 
 **为什么用真 MySQL / 真 Redis，而不是 SQLite / fakeredis：**
-- `claim_pending` 的 `FOR UPDATE SKIP LOCKED` 是 MySQL 专有，SQLite 执行不了
-- 锁的释放走 Lua `EVAL`，要真 Redis（省掉 fakeredis[lua] 这个额外依赖）
+
+ - ``claim_pending`` 的 ``FOR UPDATE SKIP LOCKED`` 是 MySQL 专有，SQLite 执行不了
+ - 锁的释放走 Lua ``EVAL``，要真 Redis（省掉 fakeredis[lua] 这个额外依赖）
+
 被测的正是这两处，所以脚手架必须说同一种语言。
 
-**配置从哪来：** compose 的 test 服务把 `DB_NAME=rag_ingest_test`、`REDIS_DB=15` 灌进环境变量，
-而 app 的 `settings` / `engine` / `redis_client` 都在 import 时读环境变量 —— 所以测试进程里的
-app **本来就指向测试库/测试 redis db** ，不需要 `dependency_overrides`。
+**配置从哪来：** compose 的 test 服务把 ``DB_NAME=rag_ingest_test``、``REDIS_DB=15`` 灌进环境变量，
+而 app 的 ``settings`` / ``engine`` / ``redis_client`` 都在 import 时读环境变量 —— 所以测试进程里的
+app **本来就指向测试库/测试 redis db** ，不需要 ``dependency_overrides``。
 """
 import itertools
 import os
@@ -47,8 +49,8 @@ async def prepare_database():
     """
     session 级、只做一次：建测试库 + 授权 + 建表。
 
-    **建库要用 root：** compose 里的 `MYSQL_USER` 只在 `MYSQL_DATABASE`（rag_ingest）上有权限；
-    而 `mysql_data` 是命名卷，`docker-entrypoint-initdb.d` 不会重跑 —— 所以测试库得自己建。
+    **建库要用 root：** compose 里的 ``MYSQL_USER`` 只在 ``MYSQL_DATABASE`` （rag_ingest）上有权限；
+    而 ``mysql_data`` 是命名卷，``docker-entrypoint-initdb.d`` 不会重跑 —— 所以测试库得自己建。
     """
     root_pw = os.getenv("DB_ROOT_PASSWORD", "")
     root_url = f"mysql+aiomysql://root:{root_pw}@{settings.db_host}:{settings.db_port}/"
@@ -82,8 +84,8 @@ async def _clean(prepare_database):
     """
     每个测试前清干净：TRUNCATE 四张表 + flush 当前 redis db 号。
 
-    **为什么不用「事务回滚」隔离：** 应用内部到处 `await db.commit()`
-    （`ingest`、`chunk_repo` 每次 claim/mark 都提交），外层事务回滚 **撤不掉已提交的写** 。
+    **为什么不用「事务回滚」隔离：** 应用内部到处 ``await db.commit()``
+    （``ingest``、``chunk_repo`` 每次 claim/mark 都提交），外层事务回滚 **撤不掉已提交的写** 。
     改用「建表一次 + 每测试清表」。
 
     MySQL 不允许 TRUNCATE 被外键引用的表，所以临时关掉外键检查。
@@ -101,9 +103,10 @@ async def client():
     """
     ASGI 直连的客户端（不走网络，也不需要起 uvicorn）。
 
-    **注意 `ASGITransport` 不跑 lifespan** —— 所以：
-    - 建表靠上面的 `prepare_database`（不是靠 lifespan 里的 `init_models()`）
-    - lifespan 里的 `reclaim_loop()` **不会** 启动（回收测试直接调 `reclaim_once()`）
+    **注意 ``ASGITransport`` 不跑 lifespan** —— 所以：
+
+    - 建表靠上面的 ``prepare_database`` （不是靠 lifespan 里的 ``init_models()``）
+    - lifespan 里的 ``reclaim_loop()`` **不会** 启动（回收测试直接调 ``reclaim_once()``）
     """
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
@@ -121,9 +124,9 @@ def make_doc():
     """
     造一篇 **内容唯一** 的文档。
 
-    默认带一个 **唯一的 `external_id`** —— 阶段 F 之后它是必填的，而且 **身份** 才是判「同一篇」的依据。
+    默认带一个 **唯一的 ``external_id``** —— 阶段 F 之后它是必填的，而且 **身份** 才是判「同一篇」的依据。
     计数器放在 **模块级** ：这样一个会话里绝不会重复用到同一个 id（跨测试文件的重复尤其坑）。
-    想让两篇文档"是同一篇"，就显式传同一个 `external_id`。
+    想让两篇文档"是同一篇"，就显式传同一个 ``external_id``。
     """
 
     def _make(**overrides) -> dict:
