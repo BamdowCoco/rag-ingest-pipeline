@@ -47,8 +47,12 @@ _SYSTEM_PROMPT = (
 _FENCE = re.compile(r"^```[a-zA-Z]*\s*|\s*```$")
 
 
-def _strip_fence(content: str) -> str:
-    """剥掉代码围栏（有则剥、没有就原样）。"""
+def strip_fence(content: str) -> str:
+    """剥掉代码围栏（有则剥、没有就原样）。
+
+    公开而非私有：`scripts/probe_upstream.py` 也用同一个函数去判"上游给的是不是合法 JSON" ——
+    两边判据必须一致，否则探针说"不合法"、管道却照收，看着像 bug。
+    """
     return _FENCE.sub("", content.strip()).strip()
 
 
@@ -90,7 +94,7 @@ class OpenAICompatProvider:
         # 都说明"接法不对"，而不是"这篇文档没有摘要"。抛出去 → facade 回落规则 → 几列仍有值。
         choice = (data.get("choices") or [{}])[0]
         content = (choice.get("message") or {}).get("content") or ""
-        parsed = json.loads(_strip_fence(content))
+        parsed = json.loads(strip_fence(content))
 
         if choice.get("finish_reason") == "length":
             # 撞上 max_tokens：通常 json.loads 已经因为截断的 JSON 抛了，
