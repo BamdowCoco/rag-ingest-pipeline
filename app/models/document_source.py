@@ -23,8 +23,15 @@ class DocumentSource(Base):
     __table_args__ = (UniqueConstraint("source", "external_id", name="uq_source_external"),)
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    source: Mapped[str] = mapped_column(String(50), nullable=False)
-    external_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    # 【为什么显式写 collation】不写就继承库默认的 utf8mb4_unicode_ci，而那是大小写不敏感的：
+    # 「ABC」与「abc」会被判成同一个 ID，后到的那个请求拿到 409（被误判成"同一篇在并发创建"）。
+    # 唯一索引的语义不该随部署环境的库默认漂移，所以标识列一律钉死 utf8mb4_bin。
+    # 【哪些列跟着钉】clean / raw 上的同名列也钉同一套 —— 它们只是副本、不是唯一性的权威，
+    # 但让两侧一致，才不会出现"身份大小写敏感、列表过滤器不敏感"这种错位。
+    source: Mapped[str] = mapped_column(String(50, collation="utf8mb4_bin"), nullable=False)
+    external_id: Mapped[str] = mapped_column(
+        String(200, collation="utf8mb4_bin"), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=utcnow, onupdate=utcnow, nullable=False

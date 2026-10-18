@@ -180,7 +180,6 @@ class DocumentService:
 
     async def _persist(
         self,
-        payload: DocumentCreate,
         raw: dict,
         cleaned: dict,
         *,
@@ -199,14 +198,16 @@ class DocumentService:
 
         **enrich 那几列这里一个字都不写** —— 它们由后台循环补（见 ``enricher.py``），
         落库时 ``enrich_status`` 还是默认的 ``pending``。这正是「AI 不拦请求」的落点。
+
+        **raw 不再存整包请求体** （2026-10-17 删了 ``payload`` 那列，见 §9.13-a）：
+        留痕靠独立列 —— ``source`` / ``external_id`` / ``raw_title`` / ``raw_content`` / ``received_at``
+        已经够自描述，且正文因此从三份降到两份。
         """
-        # payload 用 mode="json" —— datetime 得变成字符串，JSON 列才存得进去；
-        # 而 doc_updated_at 那列要的是真 datetime，所以两个 dump 各取所需
         raw_row = await self.repo.insert_raw(
             source=raw["source"],
+            external_id=raw.get("external_id"),
             raw_title=raw["title"],
             raw_content=raw["content"],
-            payload=payload.model_dump(mode="json"),
         )
         clean_row = await self.repo.insert_clean(
             raw_id=raw_row.id,
@@ -271,7 +272,7 @@ class DocumentService:
         lock_id = self._identity_lock_id(raw["source"], raw["external_id"])
         try:
             async with document_lock(self.redis, lock_id):
-                clean_row, created, changed = await self._apply_identified(payload, raw, cleaned)
+                clean_row, created, changed = await self._apply_identified(raw, cleaned)
         except LockNotAcquired:
             logger.info("未拿到锁（同身份正在处理）ext=%s", raw["external_id"])
             raise DocumentInProgressError() from None
@@ -331,7 +332,7 @@ class DocumentService:
         return f"src:{source}:{external_id}"
 
     async def _apply_identified(
-        self, payload: DocumentCreate, raw: dict, cleaned: dict
+        self, raw: dict, cleaned: dict
     ) -> tuple[DocumentClean, bool, bool]:
         """
         身份路径的核心： **一个事务里「读身份 → 决定 → 写」** 。
@@ -389,7 +390,7 @@ class DocumentService:
                     src.deleted_at = None
                     logger.info("身份复活 ext=%s", external_id)
 
-            clean_row = await self._persist(payload, raw, cleaned, source_id=src.id)
+            clean_row = await self._persist(raw, cleaned, source_id=src.id)
 
             if current is not None:
                 # 作废旧版本：它的块一并作废；它的内容也要释放 ——
@@ -489,7 +490,7 @@ class DocumentService:
         items: list[BulkItemResult | None] = [None] * total
 
         # ① 先全部标准化（纯函数、便宜），顺带挑出空正文的
-        prepared: list[tuple[int, DocumentCreate, dict, dict]] = []   # (index, payload, raw, cleaned)
+        prepared: list[tuple[int, dict, dict]] = []   # (index, raw, cleaned)
         # TODO: enumerate
         #   遍历可迭代对象时，同时拿到「下标」和「元素」
         for i, payload in enumerate(payloads):
@@ -498,11 +499,11 @@ class DocumentService:
             if not cleaned["content"]:
                 items[i] = BulkItemResult(index=i, status="rejected")
                 continue
-            prepared.append((i, payload, raw, cleaned))
+            prepared.append((i, raw, cleaned))
 
         created = updated = duplicates = 0
 
-        for i, payload, raw, cleaned in prepared:
+        for i, raw, cleaned in prepared:
             # ② 快路径：重推没变的文档在这一步就打住（0 次查库、0 次加锁）
             fast = await self._fast_skip(raw, cleaned)
             if fast is not None:
@@ -512,9 +513,7 @@ class DocumentService:
 
             # ③ 库路径：逐篇走身份判断（不加 Redis 锁 —— 权威是那把行锁 + 唯一约束）
             try:
-                clean_row, was_created, changed = await self._apply_identified(
-                    payload, raw, cleaned
-                )
+                clean_row, was_created, changed = await self._apply_identified(raw, cleaned)
             except Exception:
                 await self.db.rollback()
                 logger.exception("批量落库失败 index=%d ext=%s", i, raw.get("external_id"))

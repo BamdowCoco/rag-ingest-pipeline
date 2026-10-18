@@ -60,7 +60,8 @@ async def prepare_database():
 
     root_engine = create_async_engine(root_url, pool_pre_ping=True)
     async with root_engine.begin() as conn:
-        # 【DROP 而不是 IF NOT EXISTS】本仓没有 Alembic，而 `create_all` 只建缺的表、
+        # 【DROP 而不是 IF NOT EXISTS】测试库【有意】不走 Alembic（跑迁移比 create_all 慢，
+        # 见 docs/数据库设计.md §10.2）：schema 由模型的 create_all 建，而它只建缺的表、
         # 不会给已有表加列 —— 留着上一版 schema 的库会直接报 `Unknown column`。
         # 测试库本来就是一次性的，干脆每次从零开始建。
         await conn.execute(text(f"DROP DATABASE IF EXISTS `{db}`"))

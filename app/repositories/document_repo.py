@@ -27,7 +27,11 @@ class DocumentRepo:
         if source:
             stmt = stmt.where(DocumentClean.source == source)
         if q:
-            # ilike 在 MySQL 上就是 LIKE + 列的排序规则（utf8mb4_unicode_ci 本身不区分大小写）
+            # 【这行注释 2026-10-17 改准了】旧注释说"ilike 在 MySQL 上就是 LIKE + 列的排序规则"，
+            # 实测（SQLAlchemy 2.1 + MySQL 方言）它编译成 `lower(title) LIKE lower('%q%')` ——
+            # 多包了一层 lower()。这里【故意不改写 like】：显式写出"大小写不敏感"，
+            # 而不是偷偷依赖 title 列的 collation（哪天真跟着标识列改成 _bin，检索会静默变敏感）。
+            # 真正让这条查询走不了索引的是前导 %（B-tree 对前缀通配符无能为力）。
             stmt = stmt.where(DocumentClean.title.ilike(f"%{q}%"))
         return stmt
 
@@ -223,10 +227,18 @@ class DocumentRepo:
     # ---------- 写入（阶段 5） ----------
 
     async def insert_raw(
-        self, *, source: str, raw_title: str, raw_content: str, payload: dict | None = None
+        self,
+        *,
+        source: str,
+        external_id: str | None,
+        raw_title: str,
+        raw_content: str,
     ) -> DocumentRaw:
         row = DocumentRaw(
-            source=source, raw_title=raw_title, raw_content=raw_content, payload=payload
+            source=source,
+            external_id=external_id,
+            raw_title=raw_title,
+            raw_content=raw_content,
         )
         self.db.add(row)
         await self.db.flush()   # flush 只为拿到自增 id 给 clean.raw_id 用，≠ commit

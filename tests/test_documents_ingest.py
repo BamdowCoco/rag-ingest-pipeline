@@ -54,3 +54,27 @@ async def test_external_id_is_required(client, make_doc):
     doc.pop("external_id")
     r = await client.post("/api/v1/documents", json=doc)
     assert r.status_code == 422
+
+
+async def test_identity_is_case_sensitive(client, make_doc):
+    """
+    标识列是 ``utf8mb4_bin`` ⇒ 只差大小写的 ``(source, external_id)`` 是 **两篇** ，不是同一篇。
+
+    这是 §9.4 那条改动的回归测试。继承库默认 ``utf8mb4_unicode_ci`` 时，``ABC-1`` 与 ``abc-1``
+    会被唯一索引判成同一个 ID，第二个请求撞成一"更新"（甚至 409），于是这里只会剩 2 篇。
+
+    顺带证明 **列级** collation 真的生效：测试库是按库默认 ``utf8mb4_unicode_ci`` 建的
+    （见 ``conftest.prepare_database``），所以只有写在列上的 collation 才能救它。
+    """
+    for doc in (
+        make_doc(external_id="ABC-1"),
+        make_doc(external_id="abc-1"),
+        make_doc(source="Feishu", external_id="Mixed-1"),
+        make_doc(source="feishu", external_id="Mixed-1"),
+    ):
+        r = await client.post("/api/v1/documents", json=doc)
+        assert r.status_code == 201, r.text
+
+    page = await client.get("/api/v1/documents", params={"limit": 100})
+    assert page.status_code == 200
+    assert page.json()["total"] == 4

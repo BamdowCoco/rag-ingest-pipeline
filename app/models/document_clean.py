@@ -38,11 +38,18 @@ class DocumentClean(Base):
         ForeignKey("document_source.id", ondelete="CASCADE"), index=True, nullable=True
     )
     # source 放在这里：阶段 7 列表要按它过滤、阶段 8 统计要按它分组，省一次 join
-    source: Mapped[str] = mapped_column(String(50), index=True, nullable=False)
+    # collation 与身份表一致（bin）—— 不一致会出现"身份大小写敏感、过滤器不敏感"的错位。
+    # 副作用（是特性不是 bug）：`?source=Feishu` 不再命中 source='feishu'，stats 分组同理。
+    source: Mapped[str] = mapped_column(String(50, collation="utf8mb4_bin"), index=True, nullable=False)
     # 与 source 同理的反规范化：出参/列表要显示它，省一次 join 到 document_source。
     # 对某一行版本而言它是【不可变】的（这行永远属于同一个身份），所以不存在同步问题。
-    external_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    title: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
+    external_id: Mapped[str | None] = mapped_column(
+        String(200, collation="utf8mb4_bin"), nullable=True
+    )
+    # 【为什么不加索引（2026-10-17 删掉的那没用的索引）】全代码只有一处碰 title：
+    # `document_repo` 的 `ilike(f"%{q}%")` —— 前导通配符用不上 B-tree，索引纯属写放大。
+    # 真要做标题搜索，正解是 MySQL 8 的 FULLTEXT + ngram 解析器（中文必需）。见 §9.2。
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     author: Mapped[str | None] = mapped_column(String(120), nullable=True)
     url: Mapped[str | None] = mapped_column(String(500), nullable=True)
@@ -53,7 +60,8 @@ class DocumentClean(Base):
 
     # 本版本的指纹。必须自己存一份 —— document_dedup 的 hash 是全局唯一，
     # 且它记住的 clean_id 在版本作废之后就指错了，不能拿来判断"当前版本内容变了没"。
-    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # collation 与 dedup 上那一份一致（ascii_bin）：sha256 小写 hex 是纯 ASCII。
+    content_hash: Mapped[str] = mapped_column(String(64, collation="ascii_bin"), nullable=False)
     # 非 NULL = 「我已不是当前版本」。列表 / 统计一律把它过滤掉。
     superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
