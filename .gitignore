@@ -21,3 +21,7 @@ htmlcov/
 
 # 个人文档（本地学习笔记，不进仓库）
 docs/
+
+# 图的本地工具与说明：只提交 PNG 产物，导出脚本与本地笔记不入库
+assets/diagrams/pad-png.py
+assets/diagrams/README.md
