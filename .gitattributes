@@ -1,0 +1,5 @@
+# Windows 上的行尾：shell 脚本必须 LF（CRLF 的 .sh 会因为行尾那个 \r 直接报
+# `$'\r': command not found`）；批处理反过来要 CRLF（LF 的 .cmd 里 goto/标签会出错）。
+# 本仓 core.autocrlf=true，不写这两条就会被检出成错的那一种。
+*.sh text eol=lf
+*.cmd text eol=crlf

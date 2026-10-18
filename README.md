@@ -176,7 +176,7 @@ content_hash = sha256(title + "\n" + cleaned_content)
 > 现场验收（`ENRICH_PROVIDER` 走 `.env`，改完要重建 api 容器它才读得到新的环境变量；
 > **跑测试前记得把它删掉** —— 测试容器也读 `.env`）：
 > ```bash
-> sed -i 's/^ENRICH_PROVIDER=.*/ENRICH_PROVIDER=openai_compat/' .env && docker compose up -d api
+> 把 `.env` 里的 `ENRICH_PROVIDER` 改成 `openai_compat`，再 `docker compose up -d api`（改完要重建容器它才读得到）
 > # 发一篇文档 → 等后台补完 → 摘要里会出现样本标记 [中间省略]（规则侧不可能产出它）
 > docker compose stop model      # 把上游停掉
 > # 再发一篇 → 依然 201 入库；那几列是规则算出来的值（摘要里带 " … "、tags 是 jieba 真词）
@@ -288,8 +288,27 @@ rag-ingest-pipeline/
 - 第一次跑要构建镜像（装依赖 + 预热 tiktoken 词表与 jieba 词典），**会慢几分钟**，之后就快了；
 - **不需要在宿主机装 MySQL / Redis / Python** —— 这个项目只在容器里跑。
 
+> **下面每条命令都给了两版：先 Windows（cmd.exe / PowerShell），再 Git Bash / WSL / macOS。**
+> **两种 shell 里一模一样的命令只写一条**（`docker compose up -d` 这种没必要抄两遍）；
+> 不一样的就并排写出来，不用你自己翻译。查库的包装也是一对：
+> **Windows 用 `scripts\mysql.cmd`**（PowerShell 里带 `.\`，如 `.\scripts\mysql.cmd "…"`），
+> **Git Bash 用 `bash scripts/mysql.sh`** —— 两个都不用你输口令。
+>
+> 下面这几处**在 Windows 上完全不能用**，原因就一条：**cmd / PowerShell 没有 bash 那套语法**。
+>
+> - **`bash scripts/mysql.sh` 会撞 WSL**：cmd / PowerShell 里的 `bash` 命中的是
+>   `C:\Windows\System32\bash.exe` —— **WSL 2 的启动器，不是 Git 的 bash**；而 WSL 里通常没有 docker，
+>   于是报 `The command 'docker' could not be found in this WSL 2 distro`。→ 用 `scripts\mysql.cmd`。
+> - **`curl` 在 PowerShell 里是 `Invoke-WebRequest` 的别名** → 要写 `curl.exe`。
+> - **多行命令（行尾 `\` 续行）**、**heredoc（`cat > f <<'JSON'`）** → Windows 上合并成一行；
+>   JSON 别敲，仓库里现成一份（`scripts/example-doc.json`），见第 4 步。
+> - **`sed -i`**（改 `.env` 那几处）→ 直接用编辑器改那一行。
+
 ### 1. 准备配置
-```bash
+```text
+# Windows（cmd）
+copy .env.example .env
+# PowerShell / Git Bash / WSL / macOS
 cp .env.example .env      # 按需改数据库口令、库名、业务参数
 ```
 
@@ -347,22 +366,34 @@ docker compose exec -T api python -c "import urllib.request; print(urllib.reques
 两条路，挑一条：
 
 **a. 在浏览器里点（最省事）**：打开 http://localhost:8000/docs →
-`POST /api/v1/documents` → Try it out → `external_id` 填 `feishu-doc-001`、`content` 写几句 → Execute。
+`POST /api/v1/documents` → Try it out → `external_id` 填 `readme-sample-1`、`content` 写几句 → Execute。
 **期望 201**；再点 `GET /api/v1/documents` 能看到刚发的那篇。
 
-**b. 用命令行**（JSON 放文件里 —— 原因见下面的警告）：
+**b. 用命令行**（**样例 JSON 就在仓库里**：`scripts/example-doc.json`）：
+用文件、别把 JSON 内联进命令行 —— 原因见下面的警告。
+
+```bat
+:: Windows（cmd / PowerShell）—— 就【一行】，没有 heredoc、没有 \ 续行；PowerShell 里必须写 curl.exe
+curl.exe -s -i -X POST http://localhost:8000/api/v1/documents -H "Content-Type: application/json" --data-binary "@scripts/example-doc.json"
+:: 期望：最上面一行是 HTTP/1.1 201（-i 把响应头一起打出来，省掉 -w 里那些 % 的转义麻烦）
+```
 
 ```bash
-cat > /tmp/doc.json <<'JSON'
-{"source":"feishu","external_id":"feishu-doc-001","title":"部署手册","content":"第一步：准备环境。\n\n第二步：执行部署脚本。\n\n最后一步：验证健康检查通过。","url":"https://example.com/doc/1"}
-JSON
+# Git Bash / WSL / macOS
 curl -s -w '\n%{http_code}\n' -X POST http://localhost:8000/api/v1/documents \
-  -H 'Content-Type: application/json' --data-binary @/tmp/doc.json
+  -H 'Content-Type: application/json' --data-binary @scripts/example-doc.json
 # 期望：末尾一行是 201
 ```
 
-> ⚠️ **body 里带中文时，别把 JSON 内联进命令行参数** —— Windows 的 git bash 会把 argv 转成 GBK，
-> 服务端按 UTF-8 解析失败直接 400。**用 `--data-binary @文件`**（上面那样），或干脆走浏览器。
+> **样例用的是 `external_id=readme-sample-1`**，不是 syncer 每 5 秒在推的 `feishu-doc-001` ——
+> 否则你第一次发就是「更新」，返回的会是 200 而不是 201。
+> 想发自己的文档：把 `scripts/example-doc.json` 复制一份改内容（**`external_id` 记得也换一个**）。
+> 同样内容再发一次 → **200**：那是「重复不是错误」；删掉再发也会是 200（走「复活」，语义上等同更新）——
+> 都不是失败，见「核心机制」。
+
+> ⚠️ **body 里带中文时，别把 JSON 内联进命令行参数** —— Windows 的 git bash 会把 argv 转成 GBK、
+> PowerShell 会把 `-Body` 的字符串按 ANSI 编码，服务端按 UTF-8 解析失败直接 400（或中文静默变 `?`）。
+> **用 `--data-binary @文件`**（上面那样，JSON 完全不经过命令行），或干脆走浏览器。
 
 > 若宿主访问不通（Windows + WSL 的端口转发问题），改用 `docker compose exec` 从容器内部打：
 
@@ -374,13 +405,18 @@ docker compose exec -T api python -c "import urllib.request; print(urllib.reques
 ```bash
 docker compose up -d --scale syncer=2 --scale embedder=3
 
-# 同步器在推文档、worker 在认领 chunk
-docker compose logs -f syncer embedder | grep -E '\[syncer\]|\[embedder\]'
+# 同步器在推文档、worker 在认领 chunk（不加过滤也能看，加了就只看这两个）
+# Windows（cmd）         ： docker compose logs -f syncer embedder | findstr /R "syncer embedder"
+# Windows（PowerShell）  ： docker compose logs -f syncer embedder | Select-String 'syncer|embedder'
+# Git Bash / WSL / macOS ： docker compose logs -f syncer embedder | grep -E '\[syncer\]|\[embedder\]'
 
-# 去重生效：推了很多次，文档只有几个
-docker compose exec -T mysql mysql -uroot -proot123456 -e "
-  select count(*) as documents from rag_ingest.document_clean;
-  select embedding_status, count(*) from rag_ingest.document_chunk group by embedding_status;"
+# 去重生效：推了很多次，文档只有几个（一条查文档、一条查块）
+# Windows
+scripts\mysql.cmd "select count(*) as documents from document_clean;"
+scripts\mysql.cmd "select embedding_status, count(*) from document_chunk group by embedding_status;"
+# Git Bash / WSL / macOS
+bash scripts/mysql.sh "select count(*) as documents from document_clean;"
+bash scripts/mysql.sh "select embedding_status, count(*) from document_chunk group by embedding_status;"
 ```
 期望：**同步器疯狂推、worker 并发认领不重复，`document_clean` 只有几行、chunk 状态从 `pending` 流向 `done`。**
 
@@ -388,18 +424,21 @@ docker compose exec -T mysql mysql -uroot -proot123456 -e "
 
 ```bash
 # 默认 rule：文档入库只标 pending，后台循环（默认 30 秒一轮）会把它补成 done
-docker compose exec -T mysql mysql -uroot -proot123456 -e "
-  select enrich_status, count(*) from rag_ingest.document_clean group by enrich_status;" 2>/dev/null
+# Windows
+scripts\mysql.cmd "select enrich_status, count(*) from document_clean group by enrich_status;"
+# Git Bash / WSL / macOS
+bash scripts/mysql.sh "select enrich_status, count(*) from document_clean group by enrich_status;"
 
 # 切到 OpenAI 兼容档（假上游在 model 容器里，两个端点都讲）
-sed -i 's/^ENRICH_PROVIDER=.*/ENRICH_PROVIDER=openai_compat/' .env && docker compose up -d api
+# 用编辑器把 .env 里那行改成 ENRICH_PROVIDER=openai_compat（Windows 下别用 sed），然后重建容器：
+docker compose up -d api
 # 发一篇文档 → 等后台补 → 摘要里会出现样本标记 [中间省略]，tags 是 2-gram（如 "者周"）——
 # 这两样规则侧都产不出来，所以"值是谁给的"一眼可辨
 
 # 铁律现场：把上游停掉，再发一篇 → 依然 201，那几列回落到规则算出来的值
 docker compose stop model
 docker compose up -d model          # 看完恢复
-sed -i '/^ENRICH_PROVIDER=/d' .env  # 删掉这行 —— 测试容器也读 .env，留着会让测试打到真上游
+# 收尾：把 .env 里那行 ENRICH_PROVIDER 删掉（或注释掉）—— 测试容器也读 .env，留着会让测试打到真上游
 ```
 
 期望：`enrich_status` 从 `pending` 流向 `done`。
@@ -418,27 +457,34 @@ sed -i '/^ENRICH_PROVIDER=/d' .env  # 删掉这行 —— 测试容器也读 .en
 ENRICH_PROVIDER=openai_compat          # 先留 rule，等下面 Step 0 通过再切
 ENRICH_OPENAI_BASE_URL=https://api.deepseek.com
 ENRICH_OPENAI_PATH=/v1/chat/completions
-ENRICH_MODEL_NAME=deepseek-chat
+ENRICH_MODEL_NAME=deepseek-flash       # 写【当前有效】的 id：先跑一次 --models 看一眼（旧名会被重定向，见下）
 ENRICH_API_KEY=<你自己的 key>
 ENRICH_JSON_MODE=true
 ENRICH_TIMEOUT_SECONDS=20              # 默认 5 秒对云厂商太紧，而超时会"静默回落到规则"
 docker compose up -d api               # 必须重建容器，它才读得到新环境变量
 ```
 
-**先隔离变量**：别一上来就走管道。先单独验一次厂商 API，确认 key / 网络 / 模型名 / 路径都对：
+**先隔离变量**：别一上来就走管道。先单独验一次厂商 API，确认 key / 网络 / 模型名 / 路径都对
+（这两条在 cmd / PowerShell 里**一模一样**，直接粘）：
 
 ```bash
-docker compose exec -T api python scripts/probe_upstream.py
+docker compose exec -T api python scripts/probe_upstream.py --models   # 先问：这家现在认哪些 id
+docker compose exec -T api python scripts/probe_upstream.py            # 再验：真发一次极小请求
 ```
 
-它会先打出"将要用的配置"（请求地址 / 模型 / JSON 模式 / **key 配没配**），再发一次极小请求：
+`--models` 会列出厂商**当前承认的模型 id**（`GET {base}/models`）—— 模型名会随厂商演进，
+**旧名常常仍被接受、只是被重定向到当前模型**（实测：`deepseek-chat` 照样 200，
+但响应里的 `model` 是 `deepseek-flash`）。所以"名字写错没"以这张列表为准。
 
-- 通了 → 打印 `✓ 通了` + 模型 + 用量 + 内容；
+不带参数那次会先打出"将要用的配置"（请求地址 / 模型 / JSON 模式 / **key 配没配**），再发一次极小请求：
+
+- 通了 → 打印 `✓ 通了` + **上游实际服务的模型** + 用量 + 内容（**它会和"我们请求的模型"分开打** ——
+  两个数不一样是正常的，厂商在重定向）；
 - 不通 → **直接打出上游自己的错误**（比如 `HTTP 401` + `Authentication Fails`），不是一段看不懂的 traceback。
 
 通了之后再切 `ENRICH_PROVIDER=openai_compat`，发一篇文档，等后台补完。**怎么确认"值来自模型、不是规则"**：
 
-- **最硬的证据是日志那一行**：`enrich(openai_compat, model=deepseek-chat) input=… output=… tokens`
+- **最硬的证据是日志那一行**：`enrich(openai_compat, model=deepseek-flash) input=… output=… tokens`
   —— 真 token 数，**规则档从不打这行**；
 - **摘要的形状**：规则侧只会拼"首段 + 尾段"的原文（带 `" … "` 分隔符）；模型给的是一句**转述**，
   通常不带分隔符、也不是原文照抄；
@@ -446,6 +492,18 @@ docker compose exec -T api python scripts/probe_upstream.py
   （`[中间省略]` 那个样本标记只在模型**照抄样本**时才出现；它爱转述，所以别只指望这个标记。）
 
 **降级是同一套**：把 key 改错 → 再发一篇 → 依然 `201`，几列回落到规则。
+
+> **接真厂商时实测到的三件事**（2026-10-18，DeepSeek）—— 都不是 bug，但不知道就会以为哪里写错了：
+>
+> 1. **配置里的名字 ≠ 响应里的名字**：配 `deepseek-chat` 能跑，但响应里的 `model` 是 `deepseek-flash`
+>    —— 那是**上游实际服务你的模型**（旧名被重定向了）。验收看响应里那个；想写明确就改成列表里的 id。
+> 2. **假名字会被 400 拒**（"The supported API model names are …"）⇒ 它**是按名字路由的**，
+>    所以 1 那种重定向是厂商行为，不是我们把名字写错了。
+> 3. **JSON 模式不保证内容是合法 JSON**：实测遇到过一次 `{"ok":AFFIRMATIVE}`（值没加引号）——
+>    **不是每次**（随后 3 次都是合法 JSON），所以别当成必然，只当"上游可能不守约"的证据。
+>    管道里解析失败会**静默回落到规则**、文档照样入库 —— 这正是适配层不假设"上游守约"的原因。
+>    （另外那次探活还看到 `reasoning_tokens`：带思考的模型会先把 token 花在思考上，
+>    32 个 token 的探活预算可能被吃光、内容为空 —— 探针会自己说明，不是故障。）
 
 > 换别家要动什么？多数只改 `ENRICH_OPENAI_BASE_URL` + `ENRICH_MODEL_NAME`（通义是 `…/compatible-mode`、
 > Kimi 是 `https://api.moonshot.cn`）；**智谱 GLM 的路径不同**，所以 `ENRICH_OPENAI_PATH` 才是可配的。
@@ -476,6 +534,9 @@ docker compose --profile test run --rm test
 | 文档发了，但语言/摘要/关键词还是空的 | enrich 是**后台补**的：等 30 秒（一轮默认 30 秒），或 `docker compose logs api \| grep enrich` 看它在干嘛 |
 | 上游探活失败 | 脚本会打出上游的原始错误（401/400/超时），照着它说的改 `.env` |
 | 命令行查出来中文是 `????` | **不是数据坏了**：是 `mysql` **客户端**的会话字符集不是 utf8mb4（它按容器 locale 选）。compose 里已设 `LANG=C.UTF-8` 修掉了；哪天又遇到，临时加 `--default-character-set=utf8mb4` 即可。DBeaver 自己设了 utf8mb4，所以它一直正常 |
+| 命令粘进 **cmd.exe** 没反应、一行结果都不出 | 见第 0 步那两条：① **别粘多行** —— cmd 的提示符按行执行，折成两行的命令会被截断，前半截先跑掉了；② `2>/dev/null` 是 bash 写法，cmd 里要 `2>NUL`（或不写）。查库用 `scripts\mysql.cmd "select …;"` |
+| `The command 'docker' could not be found in this WSL 2 distro` | 你在 cmd / PowerShell 里跑了 `bash scripts/mysql.sh` —— 那边的 `bash` 是 **WSL 2 的启动器**（`C:\Windows\System32\bash.exe`），WSL 里通常没有 docker。换 `scripts\mysql.cmd "…"`（见第 0 步） |
+| 窗口里中文结果显示成乱码 | 这次是**控制台代码页**不是 UTF-8（**数据没问题**：库、客户端、连接都是 utf8mb4）→ 先 `chcp 65001`。**别和上面那个 `????` 搞混**：那个是会话字符集（取出来的值就错了），这个只是终端**显示**不对 |
 
 ### 端口说明
 
