@@ -18,7 +18,7 @@ from app.core.config import settings
 redis_client: aioredis.Redis = aioredis.from_url(
     settings.redis_url,
     decode_responses=True,      # 取出来直接是 str，省掉手动 .decode()
-    max_connections=20,         # 连接池上限
+    max_connections=settings.redis_max_connections,   # 连接池上限（可配，默认 50）
     health_check_interval=30,   # 空闲连接每 30s 探活一次（相当于 Redis 版的 pool_pre_ping）
 )
 

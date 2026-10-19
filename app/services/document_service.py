@@ -22,6 +22,7 @@ from app.core.exceptions import (
     DocumentNotFoundError,
     EmptyContentError,
 )
+from app.db.retry import with_transient_retry
 from app.models.document_clean import DocumentClean
 from app.repositories.chunk_repo import ChunkRepo
 from app.repositories.document_repo import DocumentRepo
@@ -272,7 +273,12 @@ class DocumentService:
         lock_id = self._identity_lock_id(raw["source"], raw["external_id"])
         try:
             async with document_lock(self.redis, lock_id):
-                clean_row, created, changed = await self._apply_identified(raw, cleaned)
+                # 死锁（1213）/ 锁等待超时（1205）是瞬时的：回滚后重跑通常就成功。
+                # 身份锁在重试期间不释放，同身份的并发仍然被挡住。
+                clean_row, created, changed = await with_transient_retry(
+                    lambda: self._apply_identified(raw, cleaned),
+                    session=self.db,
+                )
         except LockNotAcquired:
             logger.info("未拿到锁（同身份正在处理）ext=%s", raw["external_id"])
             raise DocumentInProgressError() from None
@@ -374,7 +380,10 @@ class DocumentService:
                 src = await self.repo.insert_source(source, external_id)
                 created, changed = True, True
             else:
-                current = await self.repo.get_active_version(src.id)
+                # 【必须当前读】get_source(... FOR UPDATE) 已经能看到并发刚提交的身份行；
+                # 这里若用普通 SELECT（快照读），可能看不到同一时刻写入的版本行 ——
+                # 于是误判成「身份已存在 + 新内容」，被 content_hash 唯一索引拦下 → 假 409。
+                current = await self.repo.get_active_version(src.id, for_update=True)
                 if current is not None and current.content_hash == content_hash:
                     # 内容没变 —— 不是错误，回【当前那一版】
                     # 同上：用 commit 而不是 rollback，避免属性被过期。
@@ -451,7 +460,7 @@ class DocumentService:
                     await self.db.rollback()        # 没这个身份 / 已经删过 → 幂等返回
                     return False
 
-                current = await self.repo.get_active_version(src.id)
+                current = await self.repo.get_active_version(src.id, for_update=True)
                 src.deleted_at = utcnow()
                 if current is not None:
                     await self.repo.supersede_version(current.id)
@@ -513,7 +522,10 @@ class DocumentService:
 
             # ③ 库路径：逐篇走身份判断（不加 Redis 锁 —— 权威是那把行锁 + 唯一约束）
             try:
-                clean_row, was_created, changed = await self._apply_identified(raw, cleaned)
+                clean_row, was_created, changed = await with_transient_retry(
+                    lambda: self._apply_identified(raw, cleaned),
+                    session=self.db,
+                )
             except Exception:
                 await self.db.rollback()
                 logger.exception("批量落库失败 index=%d ext=%s", i, raw.get("external_id"))

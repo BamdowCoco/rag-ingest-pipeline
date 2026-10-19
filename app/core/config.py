@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     redis_host: str = "redis"
     redis_port: int = 6379
     redis_db: int = 0
+    # 每进程连接池上限。应 ≥ 单进程最大并发；DB 池单进程上限是 10+20=30。
+    # 写死 20 时压测并发 32 会直接抛 MaxConnectionsError（不排队）。
+    redis_max_connections: int = 50
 
     # ---------- 业务参数 ----------
     cache_ttl: int = 60          # 列表/统计缓存秒数（阶段 7、8）

@@ -146,8 +146,16 @@ class DocumentRepo:
         await self.db.flush()        # flush 只为拿自增 id 给 clean.source_id 用，≠ commit
         return row
 
-    async def get_active_version(self, source_id: int) -> DocumentClean | None:
-        """当前版本 = 该身份下没被作废的那一行。"""
+    async def get_active_version(
+        self, source_id: int, *, for_update: bool = False
+    ) -> DocumentClean | None:
+        """
+        当前版本 = 该身份下没被作废的那一行。
+
+        ``for_update=True`` 走 **当前读** —— 看到的是最新已提交的行，而不是事务快照。
+        身份路径必须用它：``get_source(..., for_update=True)`` 是当前读，能看到并发刚提交的身份行；
+        这里若用快照读，可能看不到同一时刻写入的版本行，于是误判成「身份已存在 + 新内容」。
+        """
         stmt = (
             select(DocumentClean)
             .where(
@@ -157,6 +165,8 @@ class DocumentRepo:
             .order_by(DocumentClean.id.desc())
             .limit(1)
         )
+        if for_update:
+            stmt = stmt.with_for_update()
         return (await self.db.execute(stmt)).scalar_one_or_none()
 
     async def supersede_version(self, clean_id: int) -> None:
