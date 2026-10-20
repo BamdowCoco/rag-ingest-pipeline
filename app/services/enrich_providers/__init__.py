@@ -23,12 +23,22 @@ _PROVIDERS: dict[str, EnrichProvider] = {
 
 
 def get_provider(name: str) -> EnrichProvider:
-    """按名字取 provider。"""
+    """
+    按名字取 provider。
+
+    :param name: provider 名（``rule`` / ``model`` / ``openai_compat``）；
+        由 ``settings.enrich_provider`` 的 ``Literal`` 保证合法。
+    :return: 对应的 provider 单例。
+    """
     return _PROVIDERS[name]
 
 
 def available() -> list[str]:
-    """有哪些 provider 可选 —— 给排错与文档用。"""
+    """
+    有哪些 provider 可选 —— 给排错与文档用。
+
+    :return: 按字母序排好的 provider 名。
+    """
     return sorted(_PROVIDERS)
 
 

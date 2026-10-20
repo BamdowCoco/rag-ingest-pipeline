@@ -17,27 +17,57 @@ _LIST_VERSION_KEY = "documents:list:version"
 
 
 async def cache_get(redis: Redis, key: str) -> Any | None:
+    """
+    读缓存并反序列化。
+
+    :param redis: 共享 Redis 客户端。
+    :param key: 缓存键。
+    :return: 反序列化后的值；键不存在则为 ``None``。
+    """
     data = await redis.get(key)
     return None if data is None else json.loads(data)
 
 
 async def cache_set(redis: Redis, key: str, value: Any, ttl: int) -> None:
+    """
+    写缓存（JSON 序列化 + TTL）。
+
+    :param redis: 共享 Redis 客户端。
+    :param key: 缓存键。
+    :param value: 要缓存的值；datetime 等非 JSON 类型会被转成字符串。
+    :param ttl: 过期秒数。
+    """
     # ensure_ascii=False：中文在 redis-cli 里可读；default=str：datetime 等非 JSON 类型退化成字符串
     await redis.set(key, json.dumps(value, ensure_ascii=False, default=str), ex=ttl)
 
 
 async def cache_delete(redis: Redis, key: str) -> None:
+    """
+    删除单个缓存键。
+
+    :param redis: 共享 Redis 客户端。
+    :param key: 要删除的缓存键。
+    """
     await redis.delete(key)
 
 
 async def get_list_version(redis: Redis) -> int:
-    """列表缓存的当前版本号；键不存在时按 0 处理（于是键为 v0）。"""
+    """
+    列表缓存的当前版本号。
+
+    :param redis: 共享 Redis 客户端。
+    :return: 版本号；键不存在时按 0 处理（于是键为 v0）。
+    """
     v = await redis.get(_LIST_VERSION_KEY)
     return int(v) if v is not None else 0
 
 
 async def bump_list_version(redis: Redis) -> None:
-    """写入成功后调用：版本号 +1，让所有旧的列表缓存瞬间失效。"""
+    """
+    写入成功后调用：版本号 +1，让所有旧的列表缓存瞬间失效。
+
+    :param redis: 共享 Redis 客户端。
+    """
     await redis.incr(_LIST_VERSION_KEY)
 
 
@@ -47,17 +77,33 @@ def list_cache_key(version: int, *, page: int, limit: int, source: str | None) -
 
     特意【不含 q】：q 是自由文本，键空间无上限 —— 任意客户端能用随机 q 刷出无穷多个键
     把 Redis 撑爆，而且带 q 的请求命中率本来就极低。带 q 的查询直接走库。
+
+    :param version: 列表缓存的当前版本号。
+    :param page: 页码。
+    :param limit: 每页条数。
+    :param source: 来源过滤；``None`` 表示不过滤。
+    :return: 列表缓存键。
     """
     return f"documents:list:v{version}:{page}:{limit}:{source or ''}"
 
 
 def document_cache_key(document_id: int) -> str:
-    """单篇文档的缓存键。"""
+    """
+    单篇文档的缓存键。
+
+    :param document_id: 文档当前版本 id。
+    :return: 单篇缓存键。
+    """
     return f"document:{document_id}"
 
 
 def stats_cache_key(version: int) -> str:
-    """统计缓存键。与列表共用同一个版本号 —— 一次 INCR 同时作废两者。"""
+    """
+    统计缓存键。与列表共用同一个版本号 —— 一次 INCR 同时作废两者。
+
+    :param version: 列表缓存的当前版本号。
+    :return: 统计缓存键。
+    """
     return f"documents:stats:v{version}"
 
 
@@ -67,6 +113,11 @@ def chunk_list_cache_key(document_id: int, *, page: int, limit: int) -> str:
 
     **不带版本号** —— chunk 是一次写入、永不修改的，没有「写后失效」这回事，
     TTL 自然过期就够了。这正是「失效策略取决于数据可变性」的正面例子。
+
+    :param document_id: 文档当前版本 id。
+    :param page: 页码。
+    :param limit: 每页条数。
+    :return: 分块列表缓存键。
     """
     return f"document:{document_id}:chunks:{page}:{limit}"
 
@@ -84,5 +135,9 @@ def document_version_key(source: str, external_id: str) -> str:
     **失败模式要说清楚** ：这份缓存错了是 **「漏一次更新」** （重推的新内容被当成没变），
     不是去重 SET 那种「多拒一次」。所以它必须 **write-through** （DB 提交成功后才写），
     并且靠 TTL 兜底 —— Redis 被清空时未命中，落到库路径，结论仍然正确。
+
+    :param source: 文档来源。
+    :param external_id: 源系统里的稳定文档 id。
+    :return: 身份快路径键，形如 ``docver:<source>:<external_id>``。
     """
     return f"docver:{source}:{external_id}"

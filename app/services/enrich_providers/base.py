@@ -42,7 +42,16 @@ class EnrichProvider(Protocol):
 
     name: str
 
-    async def enrich(self, text: str, *, author: str | None = None) -> dict[str, Any]: ...
+    async def enrich(self, text: str, *, author: str | None = None) -> dict[str, Any]:
+        """
+        抽取文档元数据。
+
+        :param text: 正文。
+        :param author: 上游已经给的署名；``None`` 表示允许 provider 从正文开头补。
+        :return: 六项结果的 dict（形状见 ``EMPTY``）。
+        :raises Exception: 失败要向上抛，由 facade 决定回落规则。
+        """
+        ...
 
 
 def run_safely(result: dict, key: str, run: Callable[[], Any]) -> None:
@@ -51,6 +60,10 @@ def run_safely(result: dict, key: str, run: Callable[[], Any]) -> None:
 
     单独抽出来是因为"每一项各管各的 try/except"这件事本身就是设计的一部分 ——
     语言挂了不该连累摘要，摘要挂了不该连累关键词。
+
+    :param result: 结果 dict；成功时就地写入 ``key``。
+    :param key: 本次要计算的字段名。
+    :param run: 返回该字段值的零参函数；抛异常时该字段保持原值（通常是 ``None``）。
     """
     try:
         result[key] = run()

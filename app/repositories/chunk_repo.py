@@ -20,6 +20,11 @@ from app.utils.time import utcnow
 
 class ChunkRepo:
     def __init__(self, db: AsyncSession) -> None:
+        """
+        绑定请求级会话；认领/回收等方法会自行 commit（任务队列需要立即释放行锁）。
+
+        :param db: 请求级异步会话。
+        """
         self.db = db
 
     async def claim_pending(self, limit: int) -> list[DocumentChunk]:
@@ -28,6 +33,9 @@ class ChunkRepo:
 
         SKIP LOCKED 是关键：已被别人锁住的行 **直接跳过** ，所以并发调用拿到的是
         互不相交的两批。朴素写法（先 SELECT 再 UPDATE）会让两个 worker 拿到同一批。
+
+        :param limit: 本轮最多认领多少块。
+        :return: 被认领并已置为 ``processing`` 的块（本方法内部 commit 释放行锁）。
         """
         stmt = (
             select(DocumentChunk)
@@ -54,6 +62,9 @@ class ChunkRepo:
 
         **这一环最容易漏** ：worker 领了任务然后崩了，那条就永远卡在 processing ——
         没人会再碰它。没有回收，任务队列会慢慢"漏"掉一部分活。
+
+        :param older_than: ``updated_at`` 早于它的 processing 块会被放回 pending。
+        :return: 本次回收的条数。
         """
         stmt = (
             update(DocumentChunk)
@@ -70,7 +81,12 @@ class ChunkRepo:
         return result.rowcount or 0
 
     async def mark_done(self, chunk_id: int) -> bool:
-        """把某个 chunk 标成 done。返回 False 表示没这个 id。"""
+        """
+        把某个 chunk 标成 done，并记下完成时刻。
+
+        :param chunk_id: ``document_chunk.id``。
+        :return: 是否更新成功；``False`` 表示没有这个 id。
+        """
         stmt = (
             update(DocumentChunk)
             .where(DocumentChunk.id == chunk_id)
@@ -89,6 +105,9 @@ class ChunkRepo:
         故意 **不动 ``retracted_at``** —— 哪些块需要下游撤回，交给 ``claim_retractions``
         按「已 done 且未 retracted」自己筛。于是「作废时还停在 pending 的块不用撤回」
         （下游从没见过它）这件事 **自动成立** ，不用在这里特判。
+
+        :param document_id: 文档版本 id（``document_chunk.document_id``）。
+        :return: 实际作废的块数。
         """
         stmt = (
             update(DocumentChunk)
@@ -111,6 +130,9 @@ class ChunkRepo:
         也就是说它 **不共享** ``SKIP LOCKED`` 的「各拿一批」语义，这是刻意的取舍。
 
         只在 **已 done** 的块上产生任务：没被认领过的 pending 块压根没向量可删。
+
+        :param limit: 本轮最多返回多少块。
+        :return: 已作废、已 done、尚未确认删除的块；可能被多个 worker 重复拿到。
         """
         stmt = (
             select(DocumentChunk)
@@ -125,7 +147,12 @@ class ChunkRepo:
         return list((await self.db.execute(stmt)).scalars().all())
 
     async def mark_retracted(self, chunk_id: int) -> bool:
-        """下游确认「该向量已删」。返回 False 表示没这个 id、或已经确认过了。"""
+        """
+        下游确认「该向量已删」（幂等：重复确认不会重复更新）。
+
+        :param chunk_id: ``document_chunk.id``。
+        :return: 是否本次真的更新了；``False`` 表示没这个 id 或已经确认过。
+        """
         stmt = (
             update(DocumentChunk)
             .where(DocumentChunk.id == chunk_id, DocumentChunk.retracted_at.is_(None))

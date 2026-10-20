@@ -29,6 +29,8 @@ def is_configured() -> bool:
 
     给 ``alembic/env.py`` 判断用的：它知道自己是在 **应用进程内** 被调起来的
     （lifespan 跑 upgrade），还是在命令行里独立跑的 —— 前者绝不能再去套 alembic.ini。
+
+    :return: ``setup_logging`` 是否已经跑过。
     """
     return _configured
 
@@ -37,7 +39,7 @@ def setup_logging(level: str | None = None) -> None:
     """
     配置根 logger。重复调用是安全的（第二次直接返回）。
 
-    :param level: 覆盖日志级别（如 "DEBUG"）；不传则用 settings.log_level
+    :param level: 覆盖日志级别（如 "DEBUG"）；不传则用 settings.log_level。
     """
     global _configured
     if _configured:

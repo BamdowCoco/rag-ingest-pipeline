@@ -17,6 +17,11 @@ class AppError(Exception):
     """本项目所有业务异常的基类。"""
 
     def __init__(self, detail: str = "") -> None:
+        """
+        用一个可选的 detail 文本构造业务异常。
+
+        :param detail: 对外文案；不传则用子类自己的 docstring（见下方说明）。
+        """
         # 没传 detail 就退回到子类自己的文档字符串 —— 所以下面每个异常类的 docstring
         # 就是它对外的默认文案。结尾别写句号，免得各处文案不一致。
         self.detail = detail or (self.__class__.__doc__ or "业务错误").strip()
@@ -54,10 +59,22 @@ _ERROR_STATUS = {
 
 
 def register_exception_handlers(app: FastAPI) -> None:
-    """把所有 AppError 子类统一转成 {"detail": ...}（与 FastAPI 默认形状一致）。"""
+    """
+    把所有 AppError 子类统一转成 ``{"detail": ...}``（与 FastAPI 默认形状一致）。
+
+    :param app: FastAPI 应用实例；处理器会挂到它身上。
+    """
     for exc_type, code in _ERROR_STATUS.items():
 
         async def handler(request: Request, exc: AppError, _code: int = code) -> JSONResponse:
+            """
+            把一个业务异常转成 JSON 响应。
+
+            :param request: 触发异常的请求（FastAPI 传入；本处理器不需要读它）。
+            :param exc: 业务异常实例。
+            :param _code: 该异常对应的 HTTP 状态码（默认参数绑定当前循环值）。
+            :return: ``{"detail": exc.detail}`` 的 JSON 响应。
+            """
             # `_code=code` 用默认参数把当前值绑进来。少了它，闭包会把循环结束后的
             # 最后一个 code 用到所有 handler 上 —— 经典闭包坑。
             return JSONResponse(status_code=_code, content={"detail": exc.detail})

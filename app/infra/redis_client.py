@@ -28,10 +28,12 @@ async def get_redis() -> AsyncGenerator[aioredis.Redis, None]:
     请求级依赖：直接把共享客户端交给调用方。
     连接池在客户端内部管理，所以【不需要】每个请求新建客户端；用 yield 是为了
     将来若有「请求级」逻辑（如按请求开 pipeline）能有挂载点。
+
+    yield 共享客户端；作用域结束时不需要调用方做任何事（池由 lifespan 统一关）。
     """
     yield redis_client
 
 
 async def close_redis() -> None:
-    """关停时释放连接池"""
+    """关停时释放 Redis 连接池。"""
     await redis_client.aclose()

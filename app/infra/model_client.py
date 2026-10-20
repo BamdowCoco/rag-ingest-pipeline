@@ -16,10 +16,16 @@ model_client: httpx.AsyncClient = httpx.AsyncClient(timeout=settings.enrich_time
 
 
 def get_model_client() -> httpx.AsyncClient:
-    """给调用方拿这个共享客户端用。"""
+    """
+    给调用方拿这个共享客户端用。
+
+    :return: 模块级单例 ``httpx.AsyncClient``。
+    """
     return model_client
 
 
 async def close_model_client() -> None:
-    """关停时释放连接池（由 ``app/main.py`` 的 lifespan 调用）。"""
+    """
+    关停时释放连接池（由 ``app/main.py`` 的 lifespan 调用）。
+    """
     await model_client.aclose()

@@ -27,6 +27,10 @@ def extract_author(text: str, *, head_lines: int = HEAD_LINES) -> str | None:
     在正文 **开头几行** 里找署名；找不到 → ``None`` 。
 
     **故意不全文扫** —— 正文中间出现的"作者："很可能只是在引用别人的东西。
+
+    :param text: 正文。
+    :param head_lines: 只看开头多少行。
+    :return: 识别到的署名；找不到则 ``None``。
     """
     for line in text.splitlines()[:head_lines]:
         if not line.strip():

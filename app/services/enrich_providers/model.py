@@ -25,6 +25,14 @@ class ModelProvider:
     name = "model"
 
     async def enrich(self, text: str, *, author: str | None = None) -> dict[str, Any]:
+        """
+        调用自定契约的 HTTP 上游。
+
+        :param text: 正文；发出去前会截成首段+尾段样本。
+        :param author: 上游已经给的署名；非空时不覆盖。
+        :return: 六项结果的 dict。
+        :raises Exception: 上游不可用、响应结构不对等任何失败都向上抛，由 facade 回落规则。
+        """
         # 只发样本（首段 + 尾段 + 长度上限）：摘要本来只看首尾段，整篇发出去是白烧 token
         response = await get_model_client().post(
             settings.enrich_model_url,

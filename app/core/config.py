@@ -88,6 +88,11 @@ class Settings(BaseSettings):
     # ---------- 派生 DSN（用 @property 现拼，不重复存字段） ----------
     @property
     def database_url(self) -> str:
+        """
+        从拆开的字段拼出异步 MySQL DSN。
+
+        :return: ``mysql+aiomysql://`` 形式的连接串（口令已做 URL 转义）。
+        """
         # 密码里可能出现 @ : / 等字符，必须转义，否则 URL 会被解析错
         pwd = quote_plus(self.db_password)
         return (
@@ -97,6 +102,11 @@ class Settings(BaseSettings):
 
     @property
     def redis_url(self) -> str:
+        """
+        从拆开的字段拼出 Redis DSN。
+
+        :return: ``redis://host:port/db`` 形式的连接串。
+        """
         return f"redis://{self.redis_host}:{self.redis_port}/{self.redis_db}"
 
 

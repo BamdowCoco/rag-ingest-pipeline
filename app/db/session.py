@@ -42,6 +42,8 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
     （阶段 3 会在 app/api/deps.py 里 ``from app.db.session import get_db`` 再转出去，
       依赖注入链末端用它；这里先作为规范来源。）
+
+    yield 一个 ``AsyncSession``；请求正常结束时关闭，抛异常时先回滚再抛出。
     """
     async with AsyncSessionLocal() as session:
         try:

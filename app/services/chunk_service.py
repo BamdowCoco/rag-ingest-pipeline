@@ -22,13 +22,25 @@ SEPARATORS = ["\n\n", "\n", "。", "！", "？", "；", "! ", "? ", "; ", ". ", 
 
 
 def _split_keeping_sep(text: str, sep: str) -> list[str]:
-    """按 sep 切开，并把 sep 留在【前一片结尾】—— 否则句末标点会被吃掉。"""
+    """
+    按 ``sep`` 切开，并把 ``sep`` 留在 **前一片结尾** —— 否则句末标点会被吃掉。
+
+    :param text: 要切的文本。
+    :param sep: 分隔符（可以是 ``\\n\\n``、句号等）。
+    :return: 切分结果；除最后一片外，每片都以 ``sep`` 结尾。
+    """
     parts = text.split(sep)
     return [p + sep for p in parts[:-1]] + [parts[-1]]
 
 
 def _hard_split_tokens(text: str, size: int) -> list[str]:
-    """退无可退：按 **token** 硬切（encode → 切片 → decode）。"""
+    """
+    退无可退：按 **token** 硬切（encode → 切片 → decode）。
+
+    :param text: 要切的文本。
+    :param size: 每片最多多少 token。
+    :return: 切分结果；相邻片之间没有重叠。
+    """
     ids = enc.encode(text)
     # decode 必须走 decode_tokens：切片会切在多字节字符中间，直接 decode 会填 `�`（见那个函数的说明）
     return [decode_tokens(ids[i:i + size]) for i in range(0, len(ids), size)]
@@ -38,6 +50,11 @@ def _split_recursive(text: str, size: int, separators: list[str]) -> list[str]:
     """
     递归分割：先用 separators[0] 切；哪一片还是超限，就对那一片换下一级分隔符继续切。
     保证返回的每一片不超过 size 个 token。
+
+    :param text: 要切的文本。
+    :param size: 每片最多多少 token。
+    :param separators: 从强到弱的分隔符列表；空列表表示已退无可退，走 token 硬切。
+    :return: 切分结果，每一片都不超过 ``size`` 个 token。
     """
     if count_tokens(text) <= size:
         return [text]
@@ -58,7 +75,13 @@ def _split_recursive(text: str, size: int, separators: list[str]) -> list[str]:
 
 
 def _token_tail(text: str, n_tokens: int) -> str:
-    """取 text 的 **最后 n_tokens 个 token** 对应的文本 —— 用来做重叠。"""
+    """
+    取 text 的 **最后 n_tokens 个 token** 对应的文本 —— 用来做重叠。
+
+    :param text: 源文本。
+    :param n_tokens: 要取多少个尾部 token；``<= 0`` 时返回空串。
+    :return: 尾部文本；整段不足 ``n_tokens`` 时返回原文。
+    """
     if n_tokens <= 0:
         return ""
     ids = enc.encode(text)
@@ -74,6 +97,11 @@ def _merge(pieces: list[str], size: int, overlap: int) -> list[str]:
     把小片贪心合并回接近 size 的块，并让相邻块重叠 overlap 个 token。
 
     重叠的作用：一句话正好被切在两块之间时，两块里都能看到完整的它 —— 检索才匹配得上。
+
+    :param pieces: 已经切到不超过 ``size`` 的小片。
+    :param size: 目标块大小（token）。
+    :param overlap: 相邻块重叠的 token 数。
+    :return: 合并后的块（已去掉首尾空白与空块）。
     """
     chunks: list[str] = []
     cur = ""
@@ -97,6 +125,12 @@ def split_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
 
     边界情况：完全没有分隔符的文本（如无标点的长串）会一路降级到 token 硬切，
     此时块与块 **不会有重叠** —— 没有语义边界时，重叠任意内容收益很低。
+
+    :param text: 要切的文本。
+    :param size: 每块最多多少 token。
+    :param overlap: 相邻块重叠的 token 数。
+    :return: 切分后的块列表；空文本返回空列表。
+    :raises ValueError: ``size <= 0`` 或 ``overlap`` 不在 ``[0, size)`` 内。
     """
     if not text or not text.strip():
         return []
@@ -110,7 +144,12 @@ def split_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
 
 
 def make_chunks(cleaned: dict) -> list[dict]:
-    """文档（标准化后的 dict）→ chunk 列表，字段正好对应 document_chunk 的列。"""
+    """
+    文档（标准化后的 dict）→ chunk 列表，字段正好对应 ``document_chunk`` 的列。
+
+    :param cleaned: ``normalize_document`` 的产物（至少包含 ``content``）。
+    :return: 每个元素含 ``chunk_index`` / ``content`` / ``token_count``。
+    """
     parts = split_text(cleaned.get("content", ""))
     return [
         {"chunk_index": i, "content": p, "token_count": count_tokens(p)}

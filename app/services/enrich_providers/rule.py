@@ -20,6 +20,10 @@ def fill_author(result: dict[str, Any], text: str, given: str | None) -> None:
 
     两个 HTTP 档也调它 —— 模型对署名没有额外信息：那是" **只看开头几行** "的活
     （正文中间出现的"作者："很可能只是在引用别人， **猜错比留空更糟** ）。
+
+    :param result: 结果 dict；需要补署名时就地写入 ``author``。
+    :param text: 正文，用于从开头几行识别署名。
+    :param given: 上游已经给的署名；非空时不覆盖。
     """
     if not given:
         run_safely(result, "author", lambda: extract_author(text))
@@ -31,6 +35,13 @@ class RuleProvider:
     name = "rule"
 
     async def enrich(self, text: str, *, author: str | None = None) -> dict[str, Any]:
+        """
+        用纯 Python 规则补语言 / 摘要 / 关键词 / 署名。
+
+        :param text: 正文。
+        :param author: 上游已经给的署名；非空时不覆盖。
+        :return: 六项结果的 dict。
+        """
         result = dict(EMPTY)
 
         run_safely(result, "language", lambda: detect_language(text))

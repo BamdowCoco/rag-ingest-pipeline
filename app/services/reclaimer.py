@@ -34,9 +34,12 @@ logger = logging.getLogger(__name__)
 
 
 async def reclaim_once() -> int:
-    """跑一次回收（chunk + 文档的 enrich），返回 **总共** 回收了几条。
+    """
+    跑一次回收（chunk + 文档的 enrich）。
 
      **自己开 session** —— 后台任务没有请求级的依赖可借。
+
+    :return: 本次总共回收（放回 pending）的条数。
     """
     older_than = utcnow() - timedelta(seconds=settings.reclaim_after_seconds)
     async with AsyncSessionLocal() as db:
@@ -46,7 +49,11 @@ async def reclaim_once() -> int:
 
 
 async def reclaim_loop() -> None:
-    """后台循环：每 reclaim_interval_seconds 秒回收一次。"""
+    """
+    后台循环：每 ``reclaim_interval_seconds`` 秒回收一次，直到任务被取消。
+
+    无限循环，正常路径不返回；``CancelledError`` 会原样抛出以完成优雅关停。
+    """
     logger.info("回收任务已启动，每 %s 秒一次", settings.reclaim_interval_seconds)
     while True:
         await asyncio.sleep(settings.reclaim_interval_seconds)

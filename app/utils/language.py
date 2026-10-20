@@ -21,6 +21,9 @@ def detect_language(text: str) -> str | None:
     返回 ISO 639-1 语言码（``zh`` / ``en`` …）； **太短或判不出 → None** 。
 
     纯函数：只依赖 py3langid 的内置模型，不碰 IO。
+
+    :param text: 正文；内部会截到 ``MAX_CHARS`` 字符。
+    :return: ISO 639-1 语言码；文本太短或判不出时返回 ``None``。
     """
     sample = text.strip()[:MAX_CHARS]
     if len(sample) < MIN_CHARS:

@@ -17,7 +17,12 @@ enc = tiktoken.get_encoding(ENCODING_NAME)
 
 
 def count_tokens(text: str) -> int:
-    """精确 token 数。"""
+    """
+    精确 token 数。
+
+    :param text: 任意文本。
+    :return: token 数；空文本为 0。
+    """
     if not text:
         return 0
     return len(enc.encode(text))
@@ -33,5 +38,8 @@ def decode_tokens(ids: list[int]) -> str:
 
     这里用 ``errors="ignore"`` 把那半个字符 **丢掉** ：宁可少一个字符，也不要往库里写一个 ``�``
     —— 它进 embedding 就是个噪声 token，还可能被检索命中（真事：``docs/问题记录.md``）。
+
+    :param ids: token id 子序列。
+    :return: 解码后的文本；不完整的 UTF-8 字节会被丢弃。
     """
     return enc.decode(ids, errors="ignore")

@@ -18,7 +18,13 @@ _OMITTED_SEP = f"\n\n{_OMITTED}\n\n"
 
 
 def _two_ends(text: str, limit: int) -> str:
-    """头一半 + ``[中间省略]`` + 尾一半；``limit`` 太小放不下标记时退化成前缀。"""
+    """
+    头一半 + ``[中间省略]`` + 尾一半。
+
+    :param text: 要截的文本。
+    :param limit: 结果的最大字符数。
+    :return: 截断后的文本；``limit`` 小到放不下标记时退化成前缀。
+    """
     if limit <= len(_OMITTED):
         return text[:limit]
     keep = limit - len(_OMITTED)
@@ -32,6 +38,10 @@ def sample_text(text: str, *, limit: int) -> str:
     取"首段 + 尾段"，超过 ``limit`` 字就两头截； **空文本 → 空串** 。
 
     结果 **永不超过** ``limit`` 字 —— 上限是给钱包设的，不能失守。
+
+    :param text: 正文。
+    :param limit: 样本的最大字符数。
+    :return: 首段+尾段拼出的样本；空文本返回空串。
     """
     paragraphs = split_paragraphs(text)
     if not paragraphs:

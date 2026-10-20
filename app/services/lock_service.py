@@ -43,30 +43,42 @@ def lock_key(lock_id: str) -> str:
 
     **有身份时必须按身份锁，不能按内容锁** —— 同一篇文档"改了内容"前后是两个不同的
     hash，按 hash 锁等于各拿各的锁，根本拦不住"同时写同一个身份"。
+
+    :param lock_id: 锁粒度（内容 hash，或 ``src:<source>:<external_id>``）。
+    :return: Redis 锁键，形如 ``lock:doc:<lock_id>``。
     """
     return f"lock:doc:{lock_id}"
 
 
 async def acquire_lock(redis: Redis, key: str, ttl_ms: int) -> str | None:
-    """``SET key token NX PX ttl``。抢到返回 token，没抢到返回 None。"""
+    """
+    尝试加锁：``SET key token NX PX ttl``。
+
+    :param redis: 共享 Redis 客户端。
+    :param key: 锁键（见 ``lock_key``）。
+    :param ttl_ms: 锁的自动过期时间（毫秒）。
+    :return: 抢到返回本次的 token；没抢到返回 ``None``。
+    """
     token = uuid.uuid4().hex
     ok = await redis.set(key, token, nx=True, px=ttl_ms)
     return token if ok else None
 
 
 async def release_lock(redis: Redis, key: str, token: str) -> bool:
-    """Lua 原子释放：token 对得上才删。返回 True 表示确实删掉了自己的锁。"""
+    """
+    Lua 原子释放：token 对得上才删。
+
+    :param redis: 共享 Redis 客户端。
+    :param key: 锁键。
+    :param token: 加锁时拿到的 token；只有持有者能释放。
+    :return: ``True`` 表示确实删掉了自己的锁；``False`` 表示锁已过期或已被别人持有。
+    """
     result = await redis.eval(_RELEASE_LUA, 1, key, token)
     return result == 1
 
 
-
-# TODO @asynccontextmanager 作用
-#   async with 要求对象实现 异步上下文管理器协议，
-#   也就是有 __aenter__ 和 __aexit__ 两个异步方法。
-#   @asynccontextmanager 是一个语法糖：让你写一个 async 生成器函数（用 yield），
-#   它自动帮你把这个函数包装成一个满足上述协议的对象，而不用手写 __aenter__ / __aexit__。
-
+# @asynccontextmanager 把「async 生成器 + yield」包装成异步上下文管理器，
+# 省去手写 __aenter__ / __aexit__。
 @asynccontextmanager
 async def document_lock(
     redis: Redis, lock_id: str, ttl_ms: int | None = None
@@ -82,6 +94,11 @@ async def document_lock(
     TTL 默认取 ``settings.lock_ttl_ms``。TTL 是「崩溃安全」的代价：持有者若真的挂了，
     锁要等 TTL 到期才自动释放——太长拖慢恢复，太短则可能处理没完锁就没了
     （那种情况需要 fencing token，本项目不做）。
+
+    :param redis: 共享 Redis 客户端。
+    :param lock_id: 锁粒度（内容 hash 或身份串）。
+    :param ttl_ms: 锁 TTL；不传则用 ``settings.lock_ttl_ms``。
+    :raises LockNotAcquired: 锁已被别的请求持有。
     """
     key = lock_key(lock_id)
     token = await acquire_lock(redis, key, ttl_ms or settings.lock_ttl_ms)

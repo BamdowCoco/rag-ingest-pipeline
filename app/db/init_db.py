@@ -10,7 +10,11 @@ from app.db.session import engine
 
 
 async def init_models() -> None:
-    """建表。create_all 默认 checkfirst=True：表已存在就跳过，可反复调用。"""
+    """
+    建表。``create_all`` 默认 ``checkfirst=True``：表已存在就跳过，可反复调用。
+
+    测试脚手架用它建表；应用本身走 Alembic 迁移。
+    """
     # 在函数内 import：只为触发「模型注册」这个副作用，放模块顶层也行但不够显式
     import app.models  # noqa: F401
 

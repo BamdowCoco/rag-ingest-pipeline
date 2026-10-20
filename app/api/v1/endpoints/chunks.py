@@ -25,6 +25,13 @@ async def claim_chunks(
     payload: ChunkClaimRequest,
     service: TaskService = Depends(get_task_service),
 ) -> ChunkClaimResult:
+    """
+    认领待向量化的分块，同时把过时的撤回任务一并返回。
+
+    :param payload: 认领上限（``limit``）。
+    :param service: 任务服务。
+    :return: ``chunks`` 为待向量化的块，``retractions`` 为要删向量的块。
+    """
     chunks = await service.claim(payload.limit)
     # 撤回是【追加】出来的一类活：旧调用方不读 retractions 也照样工作
     retractions = await service.claim_retractions(payload.limit)
@@ -36,6 +43,13 @@ async def complete_chunk(
     chunk_id: int = Path(..., ge=1),
     service: TaskService = Depends(get_task_service),
 ) -> ChunkCompleteResult:
+    """
+    回报某个分块已完成向量化。
+
+    :param chunk_id: 分块 id（路径参数，``>= 1``）。
+    :param service: 任务服务。
+    :return: 更新后的分块 id 与状态。
+    """
     chunk = await service.complete(chunk_id)
     return ChunkCompleteResult(id=chunk.id, embedding_status=chunk.embedding_status)
 
@@ -49,5 +63,12 @@ async def retract_chunk(
     chunk_id: int = Path(..., ge=1),
     service: TaskService = Depends(get_task_service),
 ) -> ChunkRetractResult:
+    """
+    回报某个分块的向量已从向量库删除。
+
+    :param chunk_id: 分块 id（路径参数，``>= 1``）。
+    :param service: 任务服务。
+    :return: 分块 id 与 ``retracted=True``。
+    """
     chunk = await service.retract(chunk_id)
     return ChunkRetractResult(id=chunk.id, retracted=True)

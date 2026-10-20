@@ -23,6 +23,10 @@ def extract_keywords(text: str, *, topn: int = DEFAULT_TOPN) -> list[str]:
 
     返回列表而不是 ``None``：把"没有"归一成 ``None`` 是调用方（enrich）的事 ——
     它才知道那几列怎么写。
+
+    :param text: 正文。
+    :param topn: 最多取多少个关键词。
+    :return: 去空、去重且保持出现顺序的关键词列表；空文本返回 ``[]``。
     """
     if not text.strip():
         return []

@@ -36,6 +36,10 @@ async def enrich(cleaned: dict, raw: dict) -> dict:
     按 ``settings.enrich_provider`` 分派。 **绝不抛异常** 。
 
     ``raw`` 是给署名用的：要判断"调用方给没给 author"。
+
+    :param cleaned: 标准化后的字段（只读 ``content``）。
+    :param raw: 原始入参（只读 ``author``，判断上游是否已经给了署名）。
+    :return: 六项 enrich 结果（形状见 ``enrich_providers.base.EMPTY``）。
     """
     provider_name = settings.enrich_provider
 

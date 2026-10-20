@@ -32,7 +32,12 @@ logger = logging.getLogger(__name__)
 
 
 async def enrich_once(limit: int | None = None) -> int:
-    """认领一批、逐条补、写回。返回这次**补完**了几条。"""
+    """
+    认领一批、逐条补、写回。
+
+    :param limit: 本轮最多补多少篇；不传则用 ``settings.enrich_batch_size``。
+    :return: 本次实际补完的条数；``provider=off`` 时为 0。
+    """
     if settings.enrich_provider == "off":
         # 关掉了就别去认领 —— 让它们留在 pending：
         # "待办积压"比"写一堆 NULL"更诚实，而且开关一打开它们还能被补上
@@ -57,7 +62,11 @@ async def enrich_once(limit: int | None = None) -> int:
 
 
 async def enrich_loop() -> None:
-    """后台循环：每 ``enrich_interval_seconds`` 秒补一轮。"""
+    """
+    后台循环：每 ``enrich_interval_seconds`` 秒补一轮，直到任务被取消。
+
+    无限循环，正常路径不返回；``CancelledError`` 会原样抛出以完成优雅关停。
+    """
     logger.info(
         "enrich 后台补任务已启动，每 %s 秒一轮（provider=%s）",
         settings.enrich_interval_seconds,

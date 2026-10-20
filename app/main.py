@@ -38,12 +38,20 @@ def _upgrade_schema() -> None:
 
     换成迁移之后， **加列不再等于"重建库、丢数据"** —— 空库首启它会把五张表建出来，
     以后改 schema 就写一条迁移升上去。这正是前几轮反复踩的那个坑。
+
+    多 worker 启动时由 ``alembic/env.py`` 的咨询锁串行化，不会并发 DDL。
     """
     command.upgrade(AlembicConfig(str(_ALEMBIC_INI)), "head")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """
+    应用生命周期：启动时探活 Redis、跑迁移、起后台循环；关停时反序释放。
+
+    :param app: FastAPI 应用实例（由框架传入）。
+    yield 之前是启动逻辑，之后是关停逻辑。
+    """
     # ---------- 启动 ----------
     logger.info("启动 %s (debug=%s)", settings.app_name, settings.debug)
     # 只打 host:port，别把带密码的 database_url 整个打出来
@@ -88,4 +96,9 @@ app.include_router(api_router, prefix="/api/v1")
 
 @app.get("/health", tags=["health"])
 async def health() -> dict[str, str]:
+    """
+    健康检查。
+
+    :return: ``{"status": "ok"}``；能返回就说明进程在正常处理请求。
+    """
     return {"status": "ok"}

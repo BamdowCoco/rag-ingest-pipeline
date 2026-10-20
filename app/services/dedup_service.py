@@ -18,6 +18,10 @@ async def check_and_mark(redis: Redis, content_hash: str) -> bool:
 
     必须用 SADD 的 **返回值** 一步判断。写成 ``SISMEMBER`` 再 ``SADD`` 会在这两步之间留下
     竞态窗口：两个请求可能同时读到「不存在」，然后都去插入。
+
+    :param redis: 共享 Redis 客户端。
+    :param content_hash: 内容指纹。
+    :return: ``True`` = 本次新占位（大概率是新内容）；``False`` = 之前已存在（可能重复）。
     """
     added = await redis.sadd(DEDUP_KEY, content_hash)
     return added == 1
@@ -31,6 +35,9 @@ async def release_mark(redis: Redis, content_hash: str) -> None:
       而权威索引里其实没有这条记录，你还会觉得莫名其妙。
     - **正常释放时** （旧版本被更新 / 删除）：那份内容不再 active，快路径也得跟着放行，
       否则它会一直被当成"见过"。
+
+    :param redis: 共享 Redis 客户端。
+    :param content_hash: 要释放的内容指纹。
     """
     await redis.srem(DEDUP_KEY, content_hash)
 
@@ -39,11 +46,21 @@ DEDUP_REJECTED_KEY = "documents:dedup_rejected"   # 判重拒收累计计数
 
 
 async def incr_rejected(redis: Redis) -> None:
-    """判重拒收时 +1（统计接口读它）。"""
+    """
+    判重拒收时 +1（统计接口读它）。
+
+    :param redis: 共享 Redis 客户端。
+    """
     await redis.incr(DEDUP_REJECTED_KEY)
 
 
 async def get_rejected_count(redis: Redis) -> int:
+    """
+    读取「判重拒收」累计计数。
+
+    :param redis: 共享 Redis 客户端。
+    :return: 累计计数；键不存在时按 0 处理。
+    """
     v = await redis.get(DEDUP_REJECTED_KEY)
     return int(v) if v is not None else 0
 
@@ -54,6 +71,9 @@ async def incr_rejected_by(redis: Redis, n: int) -> None:
 
     批量提交时如果逐条 ``INCR``，片回退 + 逐篇重放会把同一篇计两次；
     改成「请求结束按最终 duplicates 一次 INCRBY」，口径才准。
+
+    :param redis: 共享 Redis 客户端。
+    :param n: 本次要增加的计数；``<= 0`` 时直接跳过。
     """
     if n > 0:
         await redis.incrby(DEDUP_REJECTED_KEY, n)

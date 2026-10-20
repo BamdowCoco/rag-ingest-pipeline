@@ -27,11 +27,21 @@ logger = logging.getLogger(__name__)
 
 class TaskService:
     def __init__(self, db: AsyncSession) -> None:
+        """
+        绑定请求级会话；认领/完成/撤回都直接落到 ``ChunkRepo``。
+
+        :param db: 请求级异步会话。
+        """
         self.db = db
         self.repo = ChunkRepo(db)
 
     async def claim(self, limit: int) -> list[DocumentChunk]:
-        """认领一批任务。超时回收由独立的 reclaim_loop 负责（见 reclaimer.py）。"""
+        """
+        认领一批任务。超时回收由独立的 reclaim_loop 负责（见 reclaimer.py）。
+
+        :param limit: 本轮最多认领多少块。
+        :return: 已置为 ``processing`` 的块；没有待办时返回空列表。
+        """
         rows = await self.repo.claim_pending(limit)
         logger.info("认领 %d 个待向量化 chunk", len(rows))
         return rows
@@ -42,6 +52,9 @@ class TaskService:
 
         注意它和 ``claim`` **不是一回事** ：撤回没有 in-flight 状态，多个 worker 可能拿到同一批
         （删向量是幂等的）—— 详细取舍见 ``chunk_repo.claim_retractions``。
+
+        :param limit: 本轮最多返回多少块。
+        :return: 待撤回的块（所属版本已作废、且下游尚未确认删除）。
         """
         rows = await self.repo.claim_retractions(limit)
         if rows:
@@ -49,7 +62,13 @@ class TaskService:
         return rows
 
     async def complete(self, chunk_id: int) -> DocumentChunk:
-        """回报某个 chunk 已完成。id 不存在 → 404。"""
+        """
+        回报某个 chunk 已完成。
+
+        :param chunk_id: ``document_chunk.id``。
+        :return: 更新后的 chunk 行（已 ``expire_all`` 重新读取）。
+        :raises ChunkNotFoundError: id 不存在。
+        """
         if not await self.repo.mark_done(chunk_id):
             logger.info("回报完成失败：chunk 不存在 id=%s", chunk_id)
             raise ChunkNotFoundError()
@@ -64,9 +83,13 @@ class TaskService:
 
     async def retract(self, chunk_id: int) -> DocumentChunk:
         """
-        回报「该向量已从向量库删掉」。id 不存在、或已经确认过 → 404。
+        回报「该向量已从向量库删掉」。
 
         ``mark_done`` 那条注释同样适用：Core update() 绕过 ORM，取之前要先 ``expire_all()``。
+
+        :param chunk_id: ``document_chunk.id``。
+        :return: 更新后的 chunk 行。
+        :raises ChunkNotFoundError: id 不存在，或已经确认过撤回。
         """
         if not await self.repo.mark_retracted(chunk_id):
             logger.info("回报撤回失败：chunk 不存在或已确认过 id=%s", chunk_id)

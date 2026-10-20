@@ -69,6 +69,12 @@ class _SliceAbort(Exception):
 
 class DocumentService:
     def __init__(self, db: AsyncSession, redis: Redis) -> None:
+        """
+        绑定请求级会话与共享 Redis 客户端，并初始化各仓储与多行 planner。
+
+        :param db: 请求级异步会话；事务边界由本服务的各入口控制。
+        :param redis: 共享 Redis 客户端（快路径判重、分布式锁、缓存/版本号）。
+        """
         self.db = db
         self.redis = redis          # 快路径判重、分布式锁、缓存/版本号
         self.repo = DocumentRepo(db)
@@ -86,6 +92,12 @@ class DocumentService:
 
         带 ``q`` 的请求【不进缓存】：q 是自由文本、键空间无上限（能被刷爆），
         且命中率极低 —— 直接查库反而更划算。
+
+        :param page: 页码，从 1 开始。
+        :param limit: 每页条数。
+        :param source: 按来源过滤；``None`` 表示不过滤。
+        :param q: 标题/正文关键词；一旦传入就绕过缓存（原因见上）。
+        :return: ``(本页文档 dict 列表, 满足条件的总数)``，dict 已转成 JSON 友好格式。
         """
         cache_key: str | None = None
         if q is None:
@@ -112,6 +124,10 @@ class DocumentService:
 
         注意：本项目文档写入后永不修改，所以单条缓存用纯 TTL 就够，
         不需要「写时删」—— 失效策略取决于数据可变性，可变数据才需要写时失效。
+
+        :param document_id: 文档当前版本的主键 ``document_clean.id``。
+        :return: 文档出参；命中缓存时直接反序列化返回。
+        :raises DocumentNotFoundError: 该 id 不存在。
         """
         cache_key = document_cache_key(document_id)
         cached = await cache_get(self.redis, cache_key)
@@ -137,6 +153,9 @@ class DocumentService:
         注意 chunk_status 的陈旧度：版本号只在【文档写入】时 +1，而 claim/complete
         不动版本号，所以「向量化积压」最多陈旧一个 cache_ttl（默认 60s）。
         看板指标 60s 粒度可接受，也与 total/today_count 的陈旧度一致 —— 不为它破例。
+
+        :return: 统计字段 dict（total / by_source / today_count / dedup_rejected /
+            chunk_status）。
         """
         version = await get_list_version(self.redis)
         cache_key = stats_cache_key(version)
@@ -164,6 +183,12 @@ class DocumentService:
         为什么不像列表/统计那样用版本号：chunk 是 **一次写入、永不修改** 的 ——
         没有「写后失效」这回事，TTL 自然过期就够了。
         这正是「失效策略取决于数据可变性」的正面例子。
+
+        :param document_id: 要查的文档当前版本 id。
+        :param page: 页码，从 1 开始。
+        :param limit: 每页条数。
+        :return: ``(本页分块 dict 列表, 分块总数)``。
+        :raises DocumentNotFoundError: 文档不存在（空结果时会再确认一次）。
         """
         cache_key = chunk_list_cache_key(document_id, page=page, limit=limit)
         cached = await cache_get(self.redis, cache_key)
@@ -210,6 +235,11 @@ class DocumentService:
         **raw 不再存整包请求体** （2026-10-17 删了 ``payload`` 那列，见 §9.13-a）：
         留痕靠独立列 —— ``source`` / ``external_id`` / ``raw_title`` / ``raw_content`` / ``received_at``
         已经够自描述，且正文因此从三份降到两份。
+
+        :param raw: 原始入参 dict（标准化之前）。
+        :param cleaned: ``normalize_document`` 的产物（标题/正文/哈希等）。
+        :param source_id: 该文档身份行的 id（``document_source.id``）。
+        :return: 新建的 ``document_clean`` 行（已 flush、未 commit）。
         """
         raw_row = await self.repo.insert_raw(
             source=raw["source"],
@@ -242,7 +272,12 @@ class DocumentService:
         return clean_row
 
     async def _find_existing(self, content_hash: str) -> DocumentClean | None:
-        """按内容指纹回读「已存在」的那篇文档（准入检查命中时要把这篇回给调用方）。"""
+        """
+        按内容指纹回读「已存在」的那篇文档（准入检查命中时要把这篇回给调用方）。
+
+        :param content_hash: 标准化后标题+正文的 sha256。
+        :return: 持有该内容的当前版本；索引里没有则为 ``None``（幽灵占位的情况）。
+        """
         dedup = await self.dedup_repo.get_by_hash(content_hash)
         if dedup is None:
             return None
@@ -258,6 +293,12 @@ class DocumentService:
         - **库路径** ：没有身份行 → 过准入检查后新建；有 → 比 hash 决定跳过还是更新
 
         返回 (文档, 是否新建)，接口层据此回 201 / 200。
+
+        :param payload: 单篇提交的入参（``external_id`` 必填）。
+        :return: ``(当前版本行, 是否新建)``。
+        :raises EmptyContentError: 标准化后正文为空。
+        :raises DocumentInProgressError: 同身份的并发请求正持有分布式锁。
+        :raises ContentConflictError: 更新时新内容已被别的身份持有。
         """
         raw = payload.model_dump()
         cleaned = normalize_document(raw)
@@ -307,6 +348,12 @@ class DocumentService:
         **失败模式** ：这份缓存错了是 **「漏一次更新」** （把新内容当成没变），
         不是去重 SET 那种「多拒一次」—— 严重性不同，所以它 write-through + TTL 兜底。
         读不到实体行（缓存与库不同步）时 **老实回落** 到库路径，不硬信缓存。
+
+        :param raw: 原始入参 dict。
+        :param cleaned: 标准化后的字段 + ``content_hash``。
+        :param count: 命中时是否给「判重拒收」计数器 +1。批量入口按最终结果统一计数，
+            所以传 ``False``。
+        :return: 缓存指向的当前版本；未命中或已作废则 ``None``（调用方回落库路径）。
         """
         cached = await cache_get(
             self.redis, document_version_key(raw["source"], raw["external_id"])
@@ -331,6 +378,11 @@ class DocumentService:
         """
         write-through： **DB 提交成功之后** 才写快路径。
         顺序反了就会缓存住一个根本没落库的版本 —— 那是"漏更新"，很难查。
+
+        :param source: 文档来源（如 feishu / confluence）。
+        :param external_id: 源系统里的稳定文档 id。
+        :param clean_id: 当前版本的 ``document_clean.id``。
+        :param content_hash: 当前版本的指纹。
         """
         await cache_set(
             self.redis,
@@ -346,6 +398,10 @@ class DocumentService:
         """
         身份锁的 ID。 **必须按身份锁、不能按内容锁** ——
         同一篇文档"改了内容"前后是两个不同的 hash，按 hash 锁等于各拿各的锁，根本拦不住。
+
+        :param source: 文档来源。
+        :param external_id: 源系统里的稳定文档 id。
+        :return: Redis 身份锁的 key，形如 ``src:<source>:<external_id>``。
         """
         return f"src:{source}:{external_id}"
 
@@ -369,6 +425,17 @@ class DocumentService:
 
         任何数据库冲突（IntegrityError）都直接抛出 —— 片级负责整片回滚 + 逐篇重放；
         单篇包装器负责 rollback 后的 duplicate / 409 分类。
+
+        :param raw: 原始入参 dict。
+        :param cleaned: 标准化后的字段 + ``content_hash``。
+        :param post: 收集提交成功后才执行的 Redis 副作用。
+        :param marks_added: 本事务里 ``SADD`` 返回 1 的 hash；片回滚时据此补偿。
+        :param seen_hashes: 片内 ``content_hash -> clean_row``，用于同片跨身份判重。
+        :param dirty: 片内已经写过的身份；命中过的身份不再走快路径。
+        :param count_rejected: 重复分支是否立即给计数器 +1；批量入口传 ``False``。
+        :param state: 可选出参 dict，回填 ``conflict_is_409`` 供包装器分类。
+        :return: ``(当前版本行, 是否新建, active 集合是否有变动)``。
+        :raises IntegrityError: 身份或内容唯一约束冲突，由调用方决定回滚与分类。
         """
         source, external_id = raw["source"], raw["external_id"]
         content_hash = cleaned["content_hash"]
@@ -450,6 +517,13 @@ class DocumentService:
 
         冲突分类（200 指向已有文档 / 409 / DocumentInProgress）与 Redis 写后动作
         都在这里完成；批量快路径不走它。
+
+        :param raw: 原始入参 dict。
+        :param cleaned: 标准化后的字段 + ``content_hash``。
+        :param count_rejected: 重复时是否立即给计数器 +1；批量重放传 ``False``。
+        :return: ``(当前版本行, 是否新建, active 集合是否有变动)``。
+        :raises ContentConflictError: 更新时新内容已被别的身份持有。
+        :raises DocumentInProgressError: 并发创建同一身份，被唯一约束拦下。
         """
         source, external_id = raw["source"], raw["external_id"]
         content_hash = cleaned["content_hash"]
@@ -494,7 +568,13 @@ class DocumentService:
         return result
 
     async def _apply_post_commit(self, post: PostCommit) -> None:
-        """提交成功后执行 Redis 副作用：content_hash 按最终活跃状态、docver 按最终版本。"""
+        """
+        提交成功后执行 Redis 副作用：content_hash 按最终活跃状态、docver 按最终版本。
+
+        只在 DB commit 之后调用；失败由调用方按 best-effort 处理（记日志，不回滚）。
+
+        :param post: ``PostCommit`` 收集的净效果（``active`` 与 ``versions``）。
+        """
         for content_hash, is_active in post.active.items():
             if is_active:
                 await check_and_mark(self.redis, content_hash)   # 新内容占位（幂等）
@@ -512,6 +592,10 @@ class DocumentService:
         的不变式就破了（读路径靠它才不用 join 到 document_source）。
 
         一个事务里：作废 active 版本 + 它的块 + **释放它的内容占位** → 置 ``deleted_at`` → bump 列表版本号。
+
+        :param payload: 删除信号（``source`` + ``external_id``）。
+        :return: 本次是否真的删掉了；已经删过或从来没有过都返回 ``False``。
+        :raises DocumentInProgressError: 同身份正被另一个请求处理。
         """
         lock_id = self._identity_lock_id(payload.source, payload.external_id)
         released_hash: str | None = None      # 被释放占位的那份内容，删完要在 Redis 里也放行
@@ -561,12 +645,18 @@ class DocumentService:
         - ``commit`` 成功后本片结果立即定稿；Redis 写后动作失败只记日志，绝不回滚/重放。
 
         重复 **按条跳过** 、不报错：同步器周期重推是正常行为。
+
+        :param payloads: 本次批量提交的文档（1–200 篇）。
+        :return: 汇总结果；``items`` 的顺序与请求一致，逐条状态为
+            ``created`` / ``updated`` / ``duplicate`` / ``rejected``。
         """
         total = len(payloads)
+        # 按请求下标填结果；最后把 None 过滤掉（除空正文外不会留空位）
         items: list[BulkItemResult | None] = [None] * total
 
         # ① 先全部标准化（纯函数、便宜），顺带挑出空正文的
-        prepared: list[tuple[int, dict, dict]] = []   # (index, raw, cleaned)
+        # 标准化后的条目 (请求下标, 原始 dict, 标准化 dict)；空正文已在上面剔除
+        prepared: list[tuple[int, dict, dict]] = []
         for i, payload in enumerate(payloads):
             raw = payload.model_dump()
             cleaned = normalize_document(raw)
@@ -576,12 +666,16 @@ class DocumentService:
             prepared.append((i, raw, cleaned))
 
         created = updated = duplicates = 0
+        # 只要尝试过写就 bump 列表版本：提交结果不确定时宁可多失效一次，也别漏
         attempted_write = False
         batch_size = max(1, min(200, settings.bulk_commit_size))
 
         for start in range(0, len(prepared), batch_size):
+            # 当前切片：最多 batch_size 篇
             chunk = prepared[start:start + batch_size]
+            # 本片逐条结果；提交成功（或逐篇重放完成）后才并入 items
             results: dict[int, BulkItemResult] = {}
+            # 多行写入计划；None 表示这片退回逐篇路径
             planned = None
 
             if settings.bulk_multirow_enabled:
@@ -618,9 +712,13 @@ class DocumentService:
                     await self.db.rollback()
 
                 for attempt in range(3):        # 第一次 + 最多 2 次整片重试
+                    # 提交成功后才执行的 Redis 副作用
                     post = PostCommit()
+                    # 本片 SADD 返回 1 的 hash；片回滚时逐个补偿
                     marks: set[str] = set()
+                    # 片内 content_hash -> clean_row，用于同片跨身份判重
                     seen: dict[str, DocumentClean] = {}
+                    # 片内已经写过的身份；命中后不再走快路径（缓存还是片前的旧版本）
                     dirty: set[tuple[str, str]] = set()
                     results = {}
                     try:
@@ -712,6 +810,9 @@ class DocumentService:
         """
         整片回退后逐篇重放：复用 bulk 的逐篇语义（ **不拿 Redis 身份锁** ），
         每篇一个事务 —— 正确性由已验证的单篇路径保证。
+
+        :param chunk: 要重放的切片，元素为 ``(请求下标, 原始 dict, 标准化 dict)``。
+        :return: 请求下标 -> 逐条结果；单篇失败记 ``rejected``，不中断其他篇。
         """
         results: dict[int, BulkItemResult] = {}
         for i, raw, cleaned in chunk:
@@ -738,6 +839,15 @@ class DocumentService:
     def _bulk_item(
         i: int, clean_row: DocumentClean, was_created: bool, changed: bool
     ) -> BulkItemResult:
+        """
+        把身份路径的三元结果翻译成批量响应里的单条状态。
+
+        :param i: 该文档在请求里的下标。
+        :param clean_row: 当前版本行（新建、更新或命中的那一版）。
+        :param was_created: 是否新建。
+        :param changed: active 集合是否发生变动；``False`` 表示这一篇是重复。
+        :return: 带 ``created`` / ``updated`` / ``duplicate`` 状态与 id 的单条结果。
+        """
         if not changed:
             return BulkItemResult(index=i, status="duplicate", id=clean_row.id)
         return BulkItemResult(

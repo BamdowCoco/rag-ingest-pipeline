@@ -12,7 +12,12 @@ _SEPARATOR = " … "
 
 
 def split_paragraphs(text: str) -> list[str]:
-    """按空行切段，顺带把空段丢掉。"""
+    """
+    按空行切段，顺带把空段丢掉。
+
+    :param text: 正文。
+    :return: 去掉首尾空白后的非空段落列表。
+    """
     return [p.strip() for p in text.split("\n\n") if p.strip()]
 
 
@@ -21,6 +26,10 @@ def summarize(text: str, *, limit: int = DEFAULT_LIMIT) -> str | None:
     首段 + 尾段，合并后截断到 ``limit`` 字； **空文本 → None** 。
 
     只有一段时就取它自己 —— 否则会拼出"首段 … 尾段"这种和原文一模一样的东西。
+
+    :param text: 正文。
+    :param limit: 摘要的最大字符数。
+    :return: 摘要文本；空文本返回 ``None``。
     """
     paragraphs = split_paragraphs(text)
     if not paragraphs:

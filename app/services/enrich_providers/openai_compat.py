@@ -52,6 +52,9 @@ def strip_fence(content: str) -> str:
 
     公开而非私有：`scripts/probe_upstream.py` 也用同一个函数去判"上游给的是不是合法 JSON" ——
     两边判据必须一致，否则探针说"不合法"、管道却照收，看着像 bug。
+
+    :param content: 上游返回的文本（可能带 ```` ```json ```` 围栏）。
+    :return: 去掉围栏并 strip 后的文本。
     """
     return _FENCE.sub("", content.strip()).strip()
 
@@ -62,6 +65,14 @@ class OpenAICompatProvider:
     name = "openai_compat"
 
     async def enrich(self, text: str, *, author: str | None = None) -> dict[str, Any]:
+        """
+        调 OpenAI 兼容的 chat/completions 端点。
+
+        :param text: 正文；发出去前会截成首段+尾段样本。
+        :param author: 上游已经给的署名；非空时不覆盖。
+        :return: 六项结果的 dict。
+        :raises Exception: 上游不可用、响应结构不对、content 不是合法 JSON 等失败都向上抛。
+        """
         sample = sample_text(text, limit=settings.enrich_sample_limit)
         payload: dict[str, Any] = {
             "model": settings.enrich_model_name,

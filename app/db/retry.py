@@ -22,13 +22,23 @@ TRANSIENT_MYSQL_CODES = frozenset({1213, 1205})
 
 
 def mysql_code(exc: OperationalError) -> int | None:
-    """从 SQLAlchemy 的 OperationalError 里取出 MySQL 错误码。"""
+    """
+    从 SQLAlchemy 的 OperationalError 里取出 MySQL 错误码。
+
+    :param exc: SQLAlchemy 包过的数据库异常。
+    :return: MySQL 错误码（如 1213）；取不到则为 ``None``。
+    """
     args = getattr(getattr(exc, "orig", None), "args", None)
     return args[0] if args and isinstance(args[0], int) else None
 
 
 def is_transient_error(exc: BaseException) -> bool:
-    """是不是「回滚后重跑通常就成功」的瞬时错误（1213 / 1205）。"""
+    """
+    判断是不是「回滚后重跑通常就成功」的瞬时错误（1213 / 1205）。
+
+    :param exc: 捕获到的异常。
+    :return: ``True`` 表示属于可重试的瞬时错误。
+    """
     return isinstance(exc, OperationalError) and mysql_code(exc) in TRANSIENT_MYSQL_CODES
 
 
@@ -50,6 +60,13 @@ async def with_transient_retry(
 
     默认 5 次 / 50ms 起：压测并发 16–32 时，3 次预算仍会有约 0.3% 的请求
     连续撞死锁；5 次能把它们吸收掉。最坏情况额外延迟约 0.75s，换来不返 500。
+
+    :param fn: 要执行的零参异步函数（通常是一个包住 ``_apply_identified`` 的 lambda）。
+    :param session: 出错时用来 ``rollback`` 的会话；必须是 ``fn`` 使用的同一个。
+    :param attempts: 最多尝试几次（含第一次）。
+    :param base_delay: 首次退避的秒数；之后指数递增并加随机抖动。
+    :return: ``fn`` 的返回值。
+    :raises OperationalError: 非瞬时错误，或重试次数耗尽。
     """
     for attempt in range(1, attempts + 1):
         try:

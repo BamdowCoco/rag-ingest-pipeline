@@ -33,12 +33,22 @@ _RE_BLANK_LINES = re.compile(r"\n[ \t]*(?:\n[ \t]*)+")  # 连续空行
 
 
 def _to_str(value: object) -> str:
-    """守卫：非字符串一律当空串（None、数字、缺字段都走这里）。"""
+    """
+    守卫：非字符串一律当空串（None、数字、缺字段都走这里）。
+
+    :param value: 任意入参值。
+    :return: 字符串本身；其它类型返回空串。
+    """
     return value if isinstance(value, str) else ""
 
 
 def _strip_markup(raw: object) -> str:
-    """步骤 ①–⑦：删块 → 删注释 → 块级转换行 → 删标签 → unescape → NFKC → 删零宽。"""
+    """
+    步骤 ①–⑦：删块 → 删注释 → 块级转换行 → 删标签 → unescape → NFKC → 删零宽。
+
+    :param raw: 原始文本（可能是非字符串，内部会先走 ``_to_str``）。
+    :return: 去掉标记与不可见字符后的文本；空输入返回空串。
+    """
     s = _to_str(raw).strip()
     if not s:
         return ""
@@ -53,14 +63,24 @@ def _strip_markup(raw: object) -> str:
 
 
 def normalize_title(raw: object) -> str:
-    """标题：折成单行，截断到 255。"""
+    """
+    标题：折成单行，截断到 255。
+
+    :param raw: 原始标题（可能是非字符串）。
+    :return: 标准化并截断后的标题。
+    """
     s = _strip_markup(raw)
     s = re.sub(r"\s+", " ", s).strip()        # 所有空白（含换行）折成单个空格
     return s[:MAX_TITLE_LEN]
 
 
 def normalize_content(raw: object) -> str:
-    """正文：保留段落 —— 行内空白折成单空格，连续空行最多留一个。"""
+    """
+    正文：保留段落 —— 行内空白折成单空格，连续空行最多留一个。
+
+    :param raw: 原始正文（可能是非字符串）。
+    :return: 标准化并截断后的正文。
+    """
     s = _strip_markup(raw)
     s = _RE_INLINE_WS.sub(" ", s)                       # 行内空白 → 单空格
     s = "\n".join(line.strip() for line in s.split("\n"))
@@ -75,6 +95,9 @@ def normalize_document(raw: dict) -> dict:
 
     返回 {"title", "content", "char_count", "clean_version", "content_hash"}。
     hash 在这里算，且基于【截断后】的文本 —— 与真正入库的内容完全一致。
+
+    :param raw: 原始入参 dict（至少含 ``title`` / ``content``）。
+    :return: 标准化后的字段与内容指纹。
     """
     title = normalize_title(raw.get("title"))
     content = normalize_content(raw.get("content"))
