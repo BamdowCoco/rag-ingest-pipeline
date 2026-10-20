@@ -6,7 +6,7 @@
 """
 from datetime import datetime
 
-from sqlalchemy import Select, func, insert, select, update
+from sqlalchemy import Select, func, insert, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.document_chunk import DocumentChunk
@@ -159,6 +159,35 @@ class DocumentRepo:
             DocumentClean.superseded_at.is_(None),
         )
         return (await self.db.execute(stmt)).scalar_one_or_none()
+
+    async def get_sources_by_keys_for_update(
+        self, pairs: list[tuple[str, str]]
+    ) -> list[DocumentSource]:
+        """一次取回本批所有身份行并加锁（多行写入的读阶段）。"""
+        if not pairs:
+            return []
+        stmt = (
+            select(DocumentSource)
+            .where(tuple_(DocumentSource.source, DocumentSource.external_id).in_(pairs))
+            .with_for_update()
+        )
+        return list((await self.db.execute(stmt)).scalars().all())
+
+    async def get_active_versions_by_source_ids_for_update(
+        self, source_ids: list[int]
+    ) -> list[DocumentClean]:
+        """一次取回这批身份下的全部当前版本并加锁。"""
+        if not source_ids:
+            return []
+        stmt = (
+            select(DocumentClean)
+            .where(
+                DocumentClean.source_id.in_(source_ids),
+                DocumentClean.superseded_at.is_(None),
+            )
+            .with_for_update()
+        )
+        return list((await self.db.execute(stmt)).scalars().all())
 
     async def get_active_version(
         self, source_id: int, *, for_update: bool = False
@@ -328,6 +357,64 @@ class DocumentRepo:
             [{"document_id": document_id, **c} for c in chunks],
         )
         return len(chunks)
+
+    # ---------- 多行写入（bulk planner 用）----------
+
+    async def insert_sources_bulk(self, rows: list[dict]) -> int | None:
+        """一条多行 INSERT；返回本语句分配的第一个自增 id。"""
+        if not rows:
+            return None
+        result = await self.db.execute(insert(DocumentSource).values(rows))
+        return result.lastrowid
+
+    async def insert_raws_bulk(self, rows: list[dict]) -> int | None:
+        if not rows:
+            return None
+        result = await self.db.execute(insert(DocumentRaw).values(rows))
+        return result.lastrowid
+
+    async def insert_cleans_bulk(self, rows: list[dict]) -> int | None:
+        if not rows:
+            return None
+        result = await self.db.execute(insert(DocumentClean).values(rows))
+        return result.lastrowid
+
+    async def insert_chunks_bulk(self, rows: list[dict]) -> int:
+        """所有文档的 chunk 合成一条多行 INSERT（不是 executemany）。"""
+        if not rows:
+            return 0
+        await self.db.execute(insert(DocumentChunk).values(rows))
+        return len(rows)
+
+    async def supersede_versions(self, clean_ids: list[int], at: datetime) -> int:
+        if not clean_ids:
+            return 0
+        result = await self.db.execute(
+            update(DocumentClean)
+            .where(DocumentClean.id.in_(clean_ids))
+            .values(superseded_at=at)
+        )
+        return result.rowcount or 0
+
+    async def supersede_chunks_by_documents(self, clean_ids: list[int], at: datetime) -> int:
+        if not clean_ids:
+            return 0
+        result = await self.db.execute(
+            update(DocumentChunk)
+            .where(DocumentChunk.document_id.in_(clean_ids))
+            .values(superseded_at=at, updated_at=at)
+        )
+        return result.rowcount or 0
+
+    async def revive_sources(self, source_ids: list[int], at: datetime) -> int:
+        if not source_ids:
+            return 0
+        result = await self.db.execute(
+            update(DocumentSource)
+            .where(DocumentSource.id.in_(source_ids))
+            .values(deleted_at=None, updated_at=at)
+        )
+        return result.rowcount or 0
 
     async def list_chunks(self, document_id: int, *, page: int, limit: int) -> list[DocumentChunk]:
         stmt = (

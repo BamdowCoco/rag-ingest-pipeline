@@ -3,7 +3,7 @@
 
 准入的 **权威** 就在这张表上（``content_hash`` 唯一索引），仓储只管读写、不做业务判断。
 """
-from sqlalchemy import delete, select
+from sqlalchemy import delete, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.document_dedup import DocumentDedup
@@ -36,4 +36,27 @@ class DedupRepo:
         """
         stmt = delete(DocumentDedup).where(DocumentDedup.content_hash == content_hash)
         result = await self.db.execute(stmt)
+        return result.rowcount or 0
+
+    # ---------- 多行写入（bulk planner 用）----------
+
+    async def get_by_hashes(self, hashes: list[str]) -> list[DocumentDedup]:
+        if not hashes:
+            return []
+        stmt = select(DocumentDedup).where(DocumentDedup.content_hash.in_(hashes))
+        return list((await self.db.execute(stmt)).scalars().all())
+
+    async def insert_dedups_bulk(self, rows: list[dict]) -> int:
+        """一条多行 INSERT（不是 executemany）。"""
+        if not rows:
+            return 0
+        await self.db.execute(insert(DocumentDedup).values(rows))
+        return len(rows)
+
+    async def delete_by_hashes(self, hashes: list[str]) -> int:
+        if not hashes:
+            return 0
+        result = await self.db.execute(
+            delete(DocumentDedup).where(DocumentDedup.content_hash.in_(hashes))
+        )
         return result.rowcount or 0

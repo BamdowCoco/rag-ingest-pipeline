@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     lock_ttl_ms: int = 10000     # 分布式锁毫秒级 TTL（阶段 6）
     # bulk 入口每多少篇提交一次事务；1 = 逐篇提交（退回旧行为，也是回滚开关）
     bulk_commit_size: int = 10
+    # 片内「身份唯一 + 内容唯一」时走多行 INSERT 快路径；false 退回逐篇切片
+    bulk_multirow_enabled: bool = True
+    # 单批允许的最大 chunk 行数（超过就退回逐篇，防大事务与包过大）
+    bulk_max_chunk_rows: int = 2000
 
     # ---------- 后台任务 ----------
     reclaim_interval_seconds: int = 60    # 回收任务多久跑一次

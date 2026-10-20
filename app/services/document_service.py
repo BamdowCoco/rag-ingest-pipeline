@@ -10,7 +10,6 @@
 阶段 D：重复改为「不是错误」（返回已存在那篇）；新增批量摄入 bulk_ingest（pipeline 判重）。
 """
 import logging
-from dataclasses import dataclass, field
 
 from redis.asyncio import Redis
 from sqlalchemy.exc import IntegrityError
@@ -36,6 +35,7 @@ from app.schemas.document import (
     DocumentDelete,
     DocumentOut,
 )
+from app.services.bulk_planner import BulkPlanner, PostCommit
 from app.services.cache_service import (
     cache_delete,
     cache_get,
@@ -63,20 +63,6 @@ from app.utils.time import beijing_today_utc_range, utcnow
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class _PostCommit:
-    """
-    片提交成功后才执行的 Redis 副作用。
-
-    ``active`` 记的是每个 content_hash 的 **最终活跃状态**（后写覆盖先写）——
-    同一片里可能出现「先释放旧内容、再以别的身份认领回来」或 A→B→A，
-    按事件顺序回放会把 SREM/SADD 的次序弄错；只记最终状态最稳。
-    """
-
-    active: dict[str, bool] = field(default_factory=dict)
-    versions: dict[tuple[str, str], DocumentClean] = field(default_factory=dict)
-
-
 class _SliceAbort(Exception):
     """片内发现「必须交给逐篇路径重新分类」的情况（例如更新撞上同片已认领的内容）。"""
 
@@ -88,6 +74,7 @@ class DocumentService:
         self.repo = DocumentRepo(db)
         self.dedup_repo = DedupRepo(db)
         self.chunk_repo = ChunkRepo(db)
+        self.planner = BulkPlanner(db)
 
     # ---------- 读 ----------
 
@@ -339,7 +326,7 @@ class DocumentService:
         return row
 
     async def _remember_version(
-        self, source: str, external_id: str, clean_row: DocumentClean
+        self, source: str, external_id: str, clean_id: int, content_hash: str
     ) -> None:
         """
         write-through： **DB 提交成功之后** 才写快路径。
@@ -348,7 +335,7 @@ class DocumentService:
         await cache_set(
             self.redis,
             document_version_key(source, external_id),
-            {"clean_id": clean_row.id, "content_hash": clean_row.content_hash},
+            {"clean_id": clean_id, "content_hash": content_hash},
             ttl=settings.cache_ttl,
         )
 
@@ -367,7 +354,7 @@ class DocumentService:
         raw: dict,
         cleaned: dict,
         *,
-        post: _PostCommit,
+        post: PostCommit,
         marks_added: set[str],
         seen_hashes: dict[str, DocumentClean],
         dirty: set[tuple[str, str]],
@@ -450,7 +437,7 @@ class DocumentService:
 
         post.active[content_hash] = True
         # 同一身份在片内出现多次时 fold 到最后一次（A→B→A 只写最终版本）
-        post.versions[identity] = clean_row
+        post.versions[identity] = (clean_row.id, content_hash)
         seen_hashes[content_hash] = clean_row
         dirty.add(identity)
         return clean_row, created, changed
@@ -466,7 +453,7 @@ class DocumentService:
         """
         source, external_id = raw["source"], raw["external_id"]
         content_hash = cleaned["content_hash"]
-        post = _PostCommit()
+        post = PostCommit()
         state: dict = {}
         try:
             result = await self._apply_identified_in_tx(
@@ -506,15 +493,15 @@ class DocumentService:
         )
         return result
 
-    async def _apply_post_commit(self, post: _PostCommit) -> None:
+    async def _apply_post_commit(self, post: PostCommit) -> None:
         """提交成功后执行 Redis 副作用：content_hash 按最终活跃状态、docver 按最终版本。"""
         for content_hash, is_active in post.active.items():
             if is_active:
                 await check_and_mark(self.redis, content_hash)   # 新内容占位（幂等）
             else:
                 await release_mark(self.redis, content_hash)     # 旧内容不再 active
-        for (source, external_id), clean_row in post.versions.items():
-            await self._remember_version(source, external_id, clean_row)
+        for (source, external_id), (clean_id, content_hash) in post.versions.items():
+            await self._remember_version(source, external_id, clean_id, content_hash)
 
     async def delete_document(self, payload: DocumentDelete) -> bool:
         """
@@ -595,53 +582,27 @@ class DocumentService:
         for start in range(0, len(prepared), batch_size):
             chunk = prepared[start:start + batch_size]
             results: dict[int, BulkItemResult] = {}
+            planned = None
 
-            for attempt in range(3):        # 第一次 + 最多 2 次整片重试
-                post = _PostCommit()
-                marks: set[str] = set()
-                seen: dict[str, DocumentClean] = {}
-                dirty: set[tuple[str, str]] = set()
-                results = {}
+            if settings.bulk_multirow_enabled:
+                planned = await self.planner.plan(
+                    chunk, max_chunk_rows=settings.bulk_max_chunk_rows
+                )
+
+            if planned is not None:
+                # ---- 多行快路径：读 + 分类已完成，这里只负责写与提交 ----
+                if planned.writes:
+                    attempted_write = True
                 try:
-                    for i, raw, cleaned in chunk:
-                        identity = (raw["source"], raw["external_id"])
-                        # 片内刚写过这个身份 → 不走快路径（缓存还是片前的旧版本）
-                        if identity not in dirty:
-                            fast = await self._fast_skip(raw, cleaned, count=False)
-                            if fast is not None:
-                                results[i] = BulkItemResult(
-                                    index=i, status="duplicate", id=fast.id
-                                )
-                                continue
-                        # 调用前就置位：即使调用中途抛异常，也按「尝试过写」bump 一次
-                        attempted_write = True
-                        clean_row, was_created, changed = await self._apply_identified_in_tx(
-                            raw,
-                            cleaned,
-                            post=post,
-                            marks_added=marks,
-                            seen_hashes=seen,
-                            dirty=dirty,
-                            count_rejected=False,
-                        )
-                        results[i] = self._bulk_item(i, clean_row, was_created, changed)
-                    await self.db.commit()       # 只读片也提交：结束事务/快照
-                except Exception as exc:
+                    results, post = await self.planner.write(planned)
+                    await self.db.commit()
+                except Exception:
                     await self.db.rollback()
-                    for h in marks:
-                        await release_mark(self.redis, h)     # 只补偿本片 SADD=1 的
-                    if is_transient_error(exc) and attempt < 2:
-                        logger.warning(
-                            "bulk 分片瞬时错误（%s），整片重试 %d/2 start=%d size=%d",
-                            type(exc).__name__, attempt + 1, start, len(chunk),
-                        )
-                        continue
                     logger.warning(
-                        "bulk 分片回退逐篇 start=%d size=%d err=%s",
-                        start, len(chunk), type(exc).__name__,
+                        "multirow 分片失败，回退逐篇 start=%d size=%d",
+                        start, len(chunk), exc_info=True,
                     )
                     results = await self._replay_chunk(chunk)
-                    break
                 else:
                     # 【提交成功即定稿】post-commit 失败只记日志，绝不回滚/重放
                     try:
@@ -651,7 +612,67 @@ class DocumentService:
                             "post-commit Redis 动作失败（DB 已提交）start=%d", start,
                             exc_info=True,
                         )
-                    break
+            else:
+                if settings.bulk_multirow_enabled:
+                    # plan() 的读阶段可能已经开了事务/拿了行锁 —— 回滚后再走逐篇
+                    await self.db.rollback()
+
+                for attempt in range(3):        # 第一次 + 最多 2 次整片重试
+                    post = PostCommit()
+                    marks: set[str] = set()
+                    seen: dict[str, DocumentClean] = {}
+                    dirty: set[tuple[str, str]] = set()
+                    results = {}
+                    try:
+                        for i, raw, cleaned in chunk:
+                            identity = (raw["source"], raw["external_id"])
+                            # 片内刚写过这个身份 → 不走快路径（缓存还是片前的旧版本）
+                            if identity not in dirty:
+                                fast = await self._fast_skip(raw, cleaned, count=False)
+                                if fast is not None:
+                                    results[i] = BulkItemResult(
+                                        index=i, status="duplicate", id=fast.id
+                                    )
+                                    continue
+                            # 调用前就置位：即使调用中途抛异常，也按「尝试过写」bump 一次
+                            attempted_write = True
+                            clean_row, was_created, changed = await self._apply_identified_in_tx(
+                                raw,
+                                cleaned,
+                                post=post,
+                                marks_added=marks,
+                                seen_hashes=seen,
+                                dirty=dirty,
+                                count_rejected=False,
+                            )
+                            results[i] = self._bulk_item(i, clean_row, was_created, changed)
+                        await self.db.commit()       # 只读片也提交：结束事务/快照
+                    except Exception as exc:
+                        await self.db.rollback()
+                        for h in marks:
+                            await release_mark(self.redis, h)     # 只补偿本片 SADD=1 的
+                        if is_transient_error(exc) and attempt < 2:
+                            logger.warning(
+                                "bulk 分片瞬时错误（%s），整片重试 %d/2 start=%d size=%d",
+                                type(exc).__name__, attempt + 1, start, len(chunk),
+                            )
+                            continue
+                        logger.warning(
+                            "bulk 分片回退逐篇 start=%d size=%d err=%s",
+                            start, len(chunk), type(exc).__name__,
+                        )
+                        results = await self._replay_chunk(chunk)
+                        break
+                    else:
+                        # 【提交成功即定稿】post-commit 失败只记日志，绝不回滚/重放
+                        try:
+                            await self._apply_post_commit(post)
+                        except Exception:
+                            logger.warning(
+                                "post-commit Redis 动作失败（DB 已提交）start=%d", start,
+                                exc_info=True,
+                            )
+                        break
 
             for i, res in results.items():
                 items[i] = res

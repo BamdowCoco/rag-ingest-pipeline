@@ -105,6 +105,8 @@ async def test_cross_identity_same_content_in_one_slice(client, make_doc, monkey
 async def test_slice_failure_falls_back_to_per_item(client, make_doc, monkeypatch):
     """片内一次异常 → 整片回退逐篇重放，后面的片不受影响。"""
     monkeypatch.setattr(settings, "bulk_commit_size", 3)
+    # 这条测的是 Stage 2 的逐篇切片路径，先关掉多行快路径
+    monkeypatch.setattr(settings, "bulk_multirow_enabled", False)
     docs = [make_doc() for _ in range(4)]
     target = docs[1]["external_id"]
 
@@ -127,6 +129,7 @@ async def test_slice_failure_falls_back_to_per_item(client, make_doc, monkeypatc
 
 async def test_slice_failure_releases_new_marks(client, make_doc, redis, monkeypatch):
     """片回滚时只释放本片 SADD 成功的占位。"""
+    monkeypatch.setattr(settings, "bulk_multirow_enabled", False)
     fake_hash = "f" * 64
     original = DocumentService._apply_identified_in_tx
 
@@ -170,6 +173,7 @@ async def test_post_commit_failure_keeps_committed_result(client, make_doc, monk
 async def test_counter_counts_each_duplicate_once(client, make_doc, redis, monkeypatch):
     """「重复 + 片失败 + 逐篇重放」组合下，计数器不能双写。"""
     monkeypatch.setattr(settings, "bulk_commit_size", 2)
+    monkeypatch.setattr(settings, "bulk_multirow_enabled", False)
     existing = make_doc(content="已经存在的正文")
     assert (await client.post("/api/v1/documents", json=existing)).status_code == 201
     await redis.delete(DEDUP_REJECTED_KEY)
