@@ -105,3 +105,14 @@ def test_count_tokens():
     assert count_tokens("中" * 100) > count_tokens("中" * 10)
     # 中英都给非零
     assert count_tokens("中") >= 1
+
+
+def test_make_chunks_token_count_matches_content():
+    """计数缓存不能改变结果：每块的 token_count 必须等于对块内容重新编码的结果。"""
+    text = "第一段。" * 50 + "\n\n" + "第二段。" * 80 + "\n\n" + "Third part. " * 60
+    chunks = make_chunks({"content": text})
+
+    assert len(chunks) > 1
+    for c in chunks:
+        assert c["token_count"] == count_tokens(c["content"])
+        assert c["token_count"] <= CHUNK_SIZE

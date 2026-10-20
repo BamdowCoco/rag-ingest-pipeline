@@ -1,6 +1,6 @@
 """多行写入：ID 链、差分语义、回退边界。"""
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal
@@ -231,3 +231,23 @@ async def test_multirow_content_conflict_falls_back(client, make_doc):
     listed = (await client.get("/api/v1/documents")).json()
     contents = {row["content"] for row in listed["items"]}
     assert "A 的内容" in contents and "B 的内容" in contents
+
+
+async def test_multirow_transient_error_retries_whole_slice(client, make_doc, monkeypatch):
+    """1213 → rollback → 重新 plan → 重试整片，而不是回退逐篇。"""
+    original = BulkPlanner.write
+    calls = {"n": 0}
+
+    async def flaky(self, plan, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OperationalError("INSERT", {}, Exception(1213, "deadlock"))
+        return await original(self, plan, **kwargs)
+
+    monkeypatch.setattr(BulkPlanner, "write", flaky)
+
+    docs = [make_doc() for _ in range(3)]
+    body = (await client.post("/api/v1/documents/bulk", json={"documents": docs})).json()
+
+    assert body["created"] == 3, body
+    assert calls["n"] == 2          # 第一次撞瞬时错误，重新 plan 后第二次成功

@@ -9,6 +9,7 @@
 阶段 B：落库后接上【切块】；新增分块查询（纯 TTL 缓存）。
 阶段 D：重复改为「不是错误」（返回已存在那篇）；新增批量摄入 bulk_ingest（pipeline 判重）。
 """
+import json
 import logging
 
 from redis.asyncio import Redis
@@ -51,6 +52,7 @@ from app.services.cache_service import (
 from app.services.chunk_service import make_chunks
 from app.services.normalize_service import normalize_document
 from app.services.dedup_service import (
+    DEDUP_KEY,
     check_and_mark,
     get_rejected_count,
     incr_rejected,
@@ -372,25 +374,6 @@ class DocumentService:
         logger.info("快路径命中 → 内容未变 ext=%s", raw["external_id"])
         return row
 
-    async def _remember_version(
-        self, source: str, external_id: str, clean_id: int, content_hash: str
-    ) -> None:
-        """
-        write-through： **DB 提交成功之后** 才写快路径。
-        顺序反了就会缓存住一个根本没落库的版本 —— 那是"漏更新"，很难查。
-
-        :param source: 文档来源（如 feishu / confluence）。
-        :param external_id: 源系统里的稳定文档 id。
-        :param clean_id: 当前版本的 ``document_clean.id``。
-        :param content_hash: 当前版本的指纹。
-        """
-        await cache_set(
-            self.redis,
-            document_version_key(source, external_id),
-            {"clean_id": clean_id, "content_hash": content_hash},
-            ttl=settings.cache_ttl,
-        )
-
     # ---------- 写：身份路径（阶段 F）----------
 
     @staticmethod
@@ -571,17 +554,31 @@ class DocumentService:
         """
         提交成功后执行 Redis 副作用：content_hash 按最终活跃状态、docver 按最终版本。
 
-        只在 DB commit 之后调用；失败由调用方按 best-effort 处理（记日志，不回滚）。
+        一批有 10+ 篇时，逐条 await 会产生 2×N 次往返；这里收进一个 pipeline，
+        一次 ``execute()`` 发完。仍然只在 commit 之后执行，失败由调用方 best-effort 处理。
 
         :param post: ``PostCommit`` 收集的净效果（``active`` 与 ``versions``）。
         """
+        if not post.active and not post.versions:
+            return
+
+        pipe = self.redis.pipeline(transaction=False)
         for content_hash, is_active in post.active.items():
             if is_active:
-                await check_and_mark(self.redis, content_hash)   # 新内容占位（幂等）
+                pipe.sadd(DEDUP_KEY, content_hash)       # 新内容占位（幂等）
             else:
-                await release_mark(self.redis, content_hash)     # 旧内容不再 active
+                pipe.srem(DEDUP_KEY, content_hash)       # 旧内容不再 active
         for (source, external_id), (clean_id, content_hash) in post.versions.items():
-            await self._remember_version(source, external_id, clean_id, content_hash)
+            # 与 cache_service.cache_set 保持同一种编码
+            pipe.set(
+                document_version_key(source, external_id),
+                json.dumps(
+                    {"clean_id": clean_id, "content_hash": content_hash},
+                    ensure_ascii=False,
+                ),
+                ex=settings.cache_ttl,
+            )
+        await pipe.execute()
 
     async def delete_document(self, payload: DocumentDelete) -> bool:
         """
@@ -687,25 +684,42 @@ class DocumentService:
                 # ---- 多行快路径：读 + 分类已完成，这里只负责写与提交 ----
                 if planned.writes:
                     attempted_write = True
-                try:
-                    results, post = await self.planner.write(planned)
-                    await self.db.commit()
-                except Exception:
-                    await self.db.rollback()
-                    logger.warning(
-                        "multirow 分片失败，回退逐篇 start=%d size=%d",
-                        start, len(chunk), exc_info=True,
-                    )
-                    results = await self._replay_chunk(chunk)
-                else:
-                    # 【提交成功即定稿】post-commit 失败只记日志，绝不回滚/重放
+                results = None
+                for attempt in range(3):        # 第一次 + 最多 2 次整片重试
                     try:
-                        await self._apply_post_commit(post)
-                    except Exception:
+                        results, post = await self.planner.write(planned)
+                        await self.db.commit()
+                    except Exception as exc:
+                        await self.db.rollback()
+                        if is_transient_error(exc) and attempt < 2:
+                            # rollback 之后旧 plan 的行锁与快照都失效了，必须重新读
+                            planned = await self.planner.plan(
+                                chunk, max_chunk_rows=settings.bulk_max_chunk_rows
+                            )
+                            if planned is None:
+                                break
+                            logger.warning(
+                                "multirow 分片瞬时错误（%s），重新 plan 后重试 %d/2 start=%d",
+                                type(exc).__name__, attempt + 1, start,
+                            )
+                            continue
                         logger.warning(
-                            "post-commit Redis 动作失败（DB 已提交）start=%d", start,
-                            exc_info=True,
+                            "multirow 分片失败，回退逐篇 start=%d size=%d",
+                            start, len(chunk), exc_info=True,
                         )
+                        break
+                    else:
+                        # 【提交成功即定稿】post-commit 失败只记日志，绝不回滚/重放
+                        try:
+                            await self._apply_post_commit(post)
+                        except Exception:
+                            logger.warning(
+                                "post-commit Redis 动作失败（DB 已提交）start=%d", start,
+                                exc_info=True,
+                            )
+                        break
+                if results is None:
+                    results = await self._replay_chunk(chunk)
             else:
                 if settings.bulk_multirow_enabled:
                     # plan() 的读阶段可能已经开了事务/拿了行锁 —— 回滚后再走逐篇

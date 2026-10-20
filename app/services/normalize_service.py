@@ -52,13 +52,17 @@ def _strip_markup(raw: object) -> str:
     s = _to_str(raw).strip()
     if not s:
         return ""
-    s = _RE_SCRIPT_STYLE.sub(" ", s)          # ①
-    s = _RE_COMMENT.sub(" ", s)               # ②
-    s = _RE_BLOCK_BREAK.sub("\n", s)          # ③
-    s = _RE_TAG.sub(" ", s)                   # ④
-    s = html.unescape(s)                      # ⑤ 必须在去标签【之后】
-    s = unicodedata.normalize("NFKC", s)      # ⑥ 全角→半角（含全角空格 U+3000）
-    s = _RE_INVISIBLE.sub("", s)              # ⑦
+    # 四个标签正则都要求出现 "<"；没有它时必然不匹配，整组跳过（纯文本的常见路径）
+    if "<" in s:
+        s = _RE_SCRIPT_STYLE.sub(" ", s)          # ①
+        s = _RE_COMMENT.sub(" ", s)               # ②
+        s = _RE_BLOCK_BREAK.sub("\n", s)          # ③
+        s = _RE_TAG.sub(" ", s)                   # ④
+    # 没有实体符时 unescape 是恒等变换
+    if "&" in s:
+        s = html.unescape(s)                      # ⑤ 必须在去标签【之后】
+    s = unicodedata.normalize("NFKC", s)          # ⑥ 全角→半角（含全角空格 U+3000）
+    s = _RE_INVISIBLE.sub("", s)                  # ⑦
     return s
 
 
@@ -83,7 +87,10 @@ def normalize_content(raw: object) -> str:
     """
     s = _strip_markup(raw)
     s = _RE_INLINE_WS.sub(" ", s)                       # 行内空白 → 单空格
-    s = "\n".join(line.strip() for line in s.split("\n"))
+    if "\n" in s:                                       # 没有换行时无需逐行 strip
+        s = "\n".join(line.strip() for line in s.split("\n"))
+    else:
+        s = s.strip()
     s = _RE_BLANK_LINES.sub("\n\n", s)                  # 连续空行 → 一个空行
     s = s.strip()
     return s[:MAX_CONTENT_LEN]

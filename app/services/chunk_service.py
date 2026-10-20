@@ -21,6 +21,23 @@ CHUNK_OVERLAP = int(CHUNK_SIZE * OVERLAP_RATIO)   # 64 token
 SEPARATORS = ["\n\n", "\n", "。", "！", "？", "；", "! ", "? ", "; ", ". ", "，", ", ", " ", ""]
 
 
+class _TokenCounter:
+    """
+    单次切块调用内的 token 计数缓存。
+
+    同一段文本会在递归分割、合并、最终统计里被反复计数；按 **完全相同的字符串**
+    缓存结果，避免重复编码。token 数不可加（BPE 在拼接处会合并），所以不能按长度估算。
+    """
+
+    def __init__(self) -> None:
+        self._cache: dict[str, int] = {}
+
+    def count(self, text: str) -> int:
+        if text not in self._cache:
+            self._cache[text] = count_tokens(text)
+        return self._cache[text]
+
+
 def _split_keeping_sep(text: str, sep: str) -> list[str]:
     """
     按 ``sep`` 切开，并把 ``sep`` 留在 **前一片结尾** —— 否则句末标点会被吃掉。
@@ -46,7 +63,9 @@ def _hard_split_tokens(text: str, size: int) -> list[str]:
     return [decode_tokens(ids[i:i + size]) for i in range(0, len(ids), size)]
 
 
-def _split_recursive(text: str, size: int, separators: list[str]) -> list[str]:
+def _split_recursive(
+    text: str, size: int, separators: list[str], counter: _TokenCounter
+) -> list[str]:
     """
     递归分割：先用 separators[0] 切；哪一片还是超限，就对那一片换下一级分隔符继续切。
     保证返回的每一片不超过 size 个 token。
@@ -54,23 +73,24 @@ def _split_recursive(text: str, size: int, separators: list[str]) -> list[str]:
     :param text: 要切的文本。
     :param size: 每片最多多少 token。
     :param separators: 从强到弱的分隔符列表；空列表表示已退无可退，走 token 硬切。
+    :param counter: 本次调用共享的 token 计数缓存。
     :return: 切分结果，每一片都不超过 ``size`` 个 token。
     """
-    if count_tokens(text) <= size:
+    if counter.count(text) <= size:
         return [text]
     if not separators:
         return _hard_split_tokens(text, size)
 
     sep, rest = separators[0], separators[1:]
     if sep == "" or sep not in text:
-        return _split_recursive(text, size, rest)            # 这一级用不上 → 降级
+        return _split_recursive(text, size, rest, counter)            # 这一级用不上 → 降级
 
     out: list[str] = []
     for piece in _split_keeping_sep(text, sep):
-        if count_tokens(piece) <= size:
+        if counter.count(piece) <= size:
             out.append(piece)
         else:
-            out.extend(_split_recursive(piece, size, rest))  # 这片还大 → 换下一级
+            out.extend(_split_recursive(piece, size, rest, counter))  # 这片还大 → 换下一级
     return out
 
 
@@ -92,7 +112,9 @@ def _token_tail(text: str, n_tokens: int) -> str:
     return decode_tokens(ids[-n_tokens:])
 
 
-def _merge(pieces: list[str], size: int, overlap: int) -> list[str]:
+def _merge(
+    pieces: list[str], size: int, overlap: int, counter: _TokenCounter
+) -> list[str]:
     """
     把小片贪心合并回接近 size 的块，并让相邻块重叠 overlap 个 token。
 
@@ -101,6 +123,7 @@ def _merge(pieces: list[str], size: int, overlap: int) -> list[str]:
     :param pieces: 已经切到不超过 ``size`` 的小片。
     :param size: 目标块大小（token）。
     :param overlap: 相邻块重叠的 token 数。
+    :param counter: 本次调用共享的 token 计数缓存。
     :return: 合并后的块（已去掉首尾空白与空块）。
     """
     chunks: list[str] = []
@@ -108,10 +131,10 @@ def _merge(pieces: list[str], size: int, overlap: int) -> list[str]:
     for p in pieces:
         # 注意：必须对【拼好的整体】编码一次。token 数不是可加的 ——
         # BPE 在拼接处会合并，`count(cur) + count(p)` 会高估。
-        if cur and count_tokens(cur + p) > size:
+        if cur and counter.count(cur + p) > size:
             chunks.append(cur)
             # 新块以当前块尾部 overlap 个 token 开头；但不能长到装不下 p，否则突破上限
-            tail_n = min(overlap, max(0, size - count_tokens(p)))
+            tail_n = min(overlap, max(0, size - counter.count(p)))
             cur = _token_tail(cur, tail_n)
         cur += p
     if cur:
@@ -119,7 +142,13 @@ def _merge(pieces: list[str], size: int, overlap: int) -> list[str]:
     return [c.strip() for c in chunks if c and c.strip()]
 
 
-def split_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+def split_text(
+    text: str,
+    size: int = CHUNK_SIZE,
+    overlap: int = CHUNK_OVERLAP,
+    *,
+    counter: _TokenCounter | None = None,
+) -> list[str]:
     """
     文本 → 块列表。size / overlap 的单位都是 token。
 
@@ -129,6 +158,7 @@ def split_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
     :param text: 要切的文本。
     :param size: 每块最多多少 token。
     :param overlap: 相邻块重叠的 token 数。
+    :param counter: 可选的 token 计数缓存；``make_chunks`` 用它复用最终统计的编码。
     :return: 切分后的块列表；空文本返回空列表。
     :raises ValueError: ``size <= 0`` 或 ``overlap`` 不在 ``[0, size)`` 内。
     """
@@ -139,8 +169,9 @@ def split_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
     if not 0 <= overlap < size:
         raise ValueError("overlap 必须满足 0 <= overlap < size")
 
-    pieces = _split_recursive(text.strip(), size, SEPARATORS)
-    return _merge(pieces, size, overlap)
+    counter = counter or _TokenCounter()
+    pieces = _split_recursive(text.strip(), size, SEPARATORS, counter)
+    return _merge(pieces, size, overlap, counter)
 
 
 def make_chunks(cleaned: dict) -> list[dict]:
@@ -150,8 +181,9 @@ def make_chunks(cleaned: dict) -> list[dict]:
     :param cleaned: ``normalize_document`` 的产物（至少包含 ``content``）。
     :return: 每个元素含 ``chunk_index`` / ``content`` / ``token_count``。
     """
-    parts = split_text(cleaned.get("content", ""))
+    counter = _TokenCounter()
+    parts = split_text(cleaned.get("content", ""), counter=counter)
     return [
-        {"chunk_index": i, "content": p, "token_count": count_tokens(p)}
+        {"chunk_index": i, "content": p, "token_count": counter.count(p)}
         for i, p in enumerate(parts)
     ]
