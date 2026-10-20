@@ -46,3 +46,14 @@ async def incr_rejected(redis: Redis) -> None:
 async def get_rejected_count(redis: Redis) -> int:
     v = await redis.get(DEDUP_REJECTED_KEY)
     return int(v) if v is not None else 0
+
+
+async def incr_rejected_by(redis: Redis, n: int) -> None:
+    """
+    一次加 n（批量入口用）。
+
+    批量提交时如果逐条 ``INCR``，片回退 + 逐篇重放会把同一篇计两次；
+    改成「请求结束按最终 duplicates 一次 INCRBY」，口径才准。
+    """
+    if n > 0:
+        await redis.incrby(DEDUP_REJECTED_KEY, n)

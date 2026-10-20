@@ -27,6 +27,11 @@ def mysql_code(exc: OperationalError) -> int | None:
     return args[0] if args and isinstance(args[0], int) else None
 
 
+def is_transient_error(exc: BaseException) -> bool:
+    """是不是「回滚后重跑通常就成功」的瞬时错误（1213 / 1205）。"""
+    return isinstance(exc, OperationalError) and mysql_code(exc) in TRANSIENT_MYSQL_CODES
+
+
 async def with_transient_retry(
     fn: Callable[[], Awaitable[T]],
     *,

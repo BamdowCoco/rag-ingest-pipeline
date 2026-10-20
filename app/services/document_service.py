@@ -10,6 +10,7 @@
 阶段 D：重复改为「不是错误」（返回已存在那篇）；新增批量摄入 bulk_ingest（pipeline 判重）。
 """
 import logging
+from dataclasses import dataclass, field
 
 from redis.asyncio import Redis
 from sqlalchemy.exc import IntegrityError
@@ -22,7 +23,7 @@ from app.core.exceptions import (
     DocumentNotFoundError,
     EmptyContentError,
 )
-from app.db.retry import with_transient_retry
+from app.db.retry import is_transient_error, with_transient_retry
 from app.models.document_clean import DocumentClean
 from app.repositories.chunk_repo import ChunkRepo
 from app.repositories.document_repo import DocumentRepo
@@ -53,12 +54,31 @@ from app.services.dedup_service import (
     check_and_mark,
     get_rejected_count,
     incr_rejected,
+    incr_rejected_by,
     release_mark,
 )
 from app.services.lock_service import LockNotAcquired, document_lock
 from app.utils.time import beijing_today_utc_range, utcnow
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _PostCommit:
+    """
+    片提交成功后才执行的 Redis 副作用。
+
+    ``active`` 记的是每个 content_hash 的 **最终活跃状态**（后写覆盖先写）——
+    同一片里可能出现「先释放旧内容、再以别的身份认领回来」或 A→B→A，
+    按事件顺序回放会把 SREM/SADD 的次序弄错；只记最终状态最稳。
+    """
+
+    active: dict[str, bool] = field(default_factory=dict)
+    versions: dict[tuple[str, str], DocumentClean] = field(default_factory=dict)
+
+
+class _SliceAbort(Exception):
+    """片内发现「必须交给逐篇路径重新分类」的情况（例如更新撞上同片已认领的内容）。"""
 
 
 class DocumentService:
@@ -276,7 +296,7 @@ class DocumentService:
                 # 死锁（1213）/ 锁等待超时（1205）是瞬时的：回滚后重跑通常就成功。
                 # 身份锁在重试期间不释放，同身份的并发仍然被挡住。
                 clean_row, created, changed = await with_transient_retry(
-                    lambda: self._apply_identified(raw, cleaned),
+                    lambda: self._apply_identified_committed(raw, cleaned),
                     session=self.db,
                 )
         except LockNotAcquired:
@@ -287,7 +307,9 @@ class DocumentService:
             await bump_list_version(self.redis)
         return clean_row, created
 
-    async def _fast_skip(self, raw: dict, cleaned: dict) -> DocumentClean | None:
+    async def _fast_skip(
+        self, raw: dict, cleaned: dict, *, count: bool = True
+    ) -> DocumentClean | None:
         """
         身份版本快路径：缓存命中且内容没变 → 直接回【当前版本】。
 
@@ -305,11 +327,14 @@ class DocumentService:
         if not cached or cached.get("content_hash") != cleaned["content_hash"]:
             return None
 
-        row = await self.repo.get_by_id(cached["clean_id"])
-        if row is None:                      # 不一致态 → 回落，别撒谎
+        # 【必须在 SQL 层过滤 superseded_at】缓存里的 clean_id 可能已被并发更新作废；
+        # 只看 ORM 对象属性会漏判（supersede_version 是 Core UPDATE，identity map 是旧值）。
+        row = await self.repo.get_active_by_id(cached["clean_id"])
+        if row is None:                      # 缓存指向已作废版本 → 回落，别撒谎
             return None
 
-        await incr_rejected(self.redis)      # 它确实挡掉了一次重复同步
+        if count:
+            await incr_rejected(self.redis)  # 它确实挡掉了一次重复同步
         logger.info("快路径命中 → 内容未变 ext=%s", raw["external_id"])
         return row
 
@@ -337,107 +362,159 @@ class DocumentService:
         """
         return f"src:{source}:{external_id}"
 
-    async def _apply_identified(
-        self, raw: dict, cleaned: dict
+    async def _apply_identified_in_tx(
+        self,
+        raw: dict,
+        cleaned: dict,
+        *,
+        post: _PostCommit,
+        marks_added: set[str],
+        seen_hashes: dict[str, DocumentClean],
+        dirty: set[tuple[str, str]],
+        count_rejected: bool = True,
+        state: dict | None = None,
     ) -> tuple[DocumentClean, bool, bool]:
         """
-        身份路径的核心： **一个事务里「读身份 → 决定 → 写」** 。
-        返回 (文档, 是否新建, active 集合有没有变动)。
+        身份路径的内核： **只读写 / flush，绝不 commit 或 rollback** 。
 
-        并发上分三层（形状与既有的「双层去重」一致）：
+        单篇由 ``_apply_identified_committed`` 包一个事务；批量由 ``bulk_ingest``
+        把 K 篇放进同一个事务、片末统一提交。
 
-        - 快路径：Redis 身份锁（把并发同篇变成 **快速 409** ）
-        - **权威** ：下面这把 ``SELECT ... FOR UPDATE`` **行锁** —— 真正串行化更新；
-          ``bulk_ingest`` 没有 Redis 锁，就全靠它
-        - 兜底：``UNIQUE(source, external_id)`` —— 并发 **创建** 同一身份时拦下
-
-        **调用方负责拿锁** （单篇拿 Redis 锁；批量有意不拿，省往返）。
+        任何数据库冲突（IntegrityError）都直接抛出 —— 片级负责整片回滚 + 逐篇重放；
+        单篇包装器负责 rollback 后的 duplicate / 409 分类。
         """
         source, external_id = raw["source"], raw["external_id"]
         content_hash = cleaned["content_hash"]
-        # 已存在身份的路径（更新 / 复活）撞车时报 409；新建撞车回 200 指向已有那篇。
-        # 差别在于：新建时"这篇已经在库里了"是个正常答案；更新时回 200 却会静默撒谎
-        # （调用方以为更新成功，其实文档还停在旧内容）。
-        conflict_is_409 = False
+        identity = (source, external_id)
+        if state is not None:
+            state["conflict_is_409"] = False
 
-        try:
-            src = await self.repo.get_source(source, external_id, for_update=True)
-            current = None
-            if src is None:
-                # ---- 新建：先问一句「这份内容是不是已经属于别人了」----
-                # 快路径（Redis SADD）只是省一次查库；真正的权威是下面落库时的唯一索引。
-                if not await check_and_mark(self.redis, content_hash):
-                    existing = await self._find_existing(content_hash)
-                    if existing is not None:
-                        # 用 commit 收尾而不是 rollback —— 本事务只读过，
-                        # 而 rollback 会把已加载对象的属性全部过期，之后 FastAPI
-                        # 在同步上下文里取属性就 MissingGreenlet。
-                        await self.db.commit()
-                        await incr_rejected(self.redis)
-                        logger.info("准入检查 → 内容已属于别人 hash=%s", content_hash[:12])
-                        return existing, False, False
-                    # Redis 说"见过"、索引里却没有 → 旧占位的幽灵（罕见、自愈），继续按新建走
-                src = await self.repo.insert_source(source, external_id)
-                created, changed = True, True
+        src = await self.repo.get_source(source, external_id, for_update=True)
+        current = None
+        if src is None:
+            # 同片内存表：这份内容已经被本事务里的另一篇认领 → 直接算 duplicate，
+            # 不等唯一索引在片末 commit 时才炸（那时整片都要回退）。
+            known = seen_hashes.get(content_hash)
+            if known is not None:
+                if count_rejected:
+                    await incr_rejected(self.redis)
+                return known, False, False
+
+            # 快路径（Redis SADD）只是省一次查库；真正的权威是落库时的唯一索引。
+            added = await check_and_mark(self.redis, content_hash)
+            if added:
+                # 返回 1 的下一行就记录：万一后面抛异常，片回滚时才知道要补偿
+                marks_added.add(content_hash)
             else:
-                # 【必须当前读】get_source(... FOR UPDATE) 已经能看到并发刚提交的身份行；
-                # 这里若用普通 SELECT（快照读），可能看不到同一时刻写入的版本行 ——
-                # 于是误判成「身份已存在 + 新内容」，被 content_hash 唯一索引拦下 → 假 409。
-                current = await self.repo.get_active_version(src.id, for_update=True)
-                if current is not None and current.content_hash == content_hash:
-                    # 内容没变 —— 不是错误，回【当前那一版】
-                    # 同上：用 commit 而不是 rollback，避免属性被过期。
-                    await self.db.commit()
+                existing = await self._find_existing(content_hash)
+                if existing is not None:
+                    if count_rejected:
+                        await incr_rejected(self.redis)
+                    logger.info("准入检查 → 内容已属于别人 hash=%s", content_hash[:12])
+                    return existing, False, False
+                # Redis 说"见过"、索引里却没有 → 旧占位的幽灵（罕见、自愈），继续按新建走
+            src = await self.repo.insert_source(source, external_id)
+            created, changed = True, True
+        else:
+            # 【必须当前读】get_source(... FOR UPDATE) 已经能看到并发刚提交的身份行；
+            # 这里若用普通 SELECT（快照读），可能看不到同一时刻写入的版本行 ——
+            # 于是误判成「身份已存在 + 新内容」，被 content_hash 唯一索引拦下 → 假 409。
+            current = await self.repo.get_active_version(src.id, for_update=True)
+            if current is not None and current.content_hash == content_hash:
+                if count_rejected:
                     await incr_rejected(self.redis)      # 它确实挡掉了一次重复同步
-                    logger.info("身份判重 → 内容未变 ext=%s", external_id)
-                    return current, False, False
+                logger.info("身份判重 → 内容未变 ext=%s", external_id)
+                return current, False, False
 
-                created, changed = False, True
-                conflict_is_409 = True       # 已存在身份 → 内容撞车是冲突，不是"已存在"
-                if src.deleted_at is not None:
-                    # 源系统删过、又推回来了 → 复活
-                    src.deleted_at = None
-                    logger.info("身份复活 ext=%s", external_id)
+            # 更新 / 复活：新内容若已被同片另一篇认领，交给逐篇路径判 409
+            if content_hash in seen_hashes:
+                raise _SliceAbort(
+                    f"同片内容冲突 ext={external_id} hash={content_hash[:12]}"
+                )
+            created, changed = False, True
+            if state is not None:
+                state["conflict_is_409"] = True   # 已存在身份 → 内容撞车是冲突
+            if src.deleted_at is not None:
+                src.deleted_at = None
+                logger.info("身份复活 ext=%s", external_id)
 
-            clean_row = await self._persist(raw, cleaned, source_id=src.id)
+        clean_row = await self._persist(raw, cleaned, source_id=src.id)
 
-            if current is not None:
-                # 作废旧版本：它的块一并作废；它的内容也要释放 ——
-                # 旧内容不再 active 了，占着位会把"其实已经不在语料里"的内容一直判成重复。
-                # 撤回任务不用在这里创建 —— claim_retractions 按「已 done 且未 retracted」自己筛。
-                await self.repo.supersede_version(current.id)
-                await self.chunk_repo.supersede_by_document(current.id)
-                await self.dedup_repo.delete_by_content_hash(current.content_hash)
+        if current is not None:
+            # 作废旧版本：它的块一并作废；它的内容也要释放 ——
+            # 旧内容不再 active，占着位会把"其实已经不在语料里"的内容一直判成重复。
+            await self.repo.supersede_version(current.id)
+            await self.chunk_repo.supersede_by_document(current.id)
+            await self.dedup_repo.delete_by_content_hash(current.content_hash)
+            post.active[current.content_hash] = False
 
+        post.active[content_hash] = True
+        # 同一身份在片内出现多次时 fold 到最后一次（A→B→A 只写最终版本）
+        post.versions[identity] = clean_row
+        seen_hashes[content_hash] = clean_row
+        dirty.add(identity)
+        return clean_row, created, changed
+
+    async def _apply_identified_committed(
+        self, raw: dict, cleaned: dict, *, count_rejected: bool = True
+    ) -> tuple[DocumentClean, bool, bool]:
+        """
+        单篇 / 批量重放用的事务包装器：一个事务、一次 commit。
+
+        冲突分类（200 指向已有文档 / 409 / DocumentInProgress）与 Redis 写后动作
+        都在这里完成；批量快路径不走它。
+        """
+        source, external_id = raw["source"], raw["external_id"]
+        content_hash = cleaned["content_hash"]
+        post = _PostCommit()
+        state: dict = {}
+        try:
+            result = await self._apply_identified_in_tx(
+                raw,
+                cleaned,
+                post=post,
+                marks_added=set(),
+                seen_hashes={},
+                dirty=set(),
+                count_rejected=count_rejected,
+                state=state,
+            )
             await self.db.commit()
         except IntegrityError:
-            # 【必须 rollback】：不回滚，session 就废了，后续任何操作都会报错。
-            # 注意：更新路径上"释放旧内容"也在这个事务里，回滚会把它一并撤销 ✓。
+            # 【必须 rollback】：不回滚 session 就废了。更新路径上「释放旧内容」
+            # 也在同一个事务里，回滚会把它一并撤销 ✓。
             await self.db.rollback()
-            await release_mark(self.redis, content_hash)     # 撤掉刚做的快路径占位
+            await release_mark(self.redis, content_hash)     # 撤掉快路径占位
             existing = await self._find_existing(content_hash)
             if existing is not None:
-                await incr_rejected(self.redis)
-                if conflict_is_409:
+                if count_rejected:
+                    await incr_rejected(self.redis)
+                if state.get("conflict_is_409"):
                     logger.info("内容撞车（更新/复活）hash=%s", content_hash[:12])
                     raise ContentConflictError() from None
                 logger.info("准入检查（唯一索引兜底）→ 内容已属于别人 hash=%s", content_hash[:12])
                 return existing, False, False
-            # 否则是并发创建同一身份 → 唯一约束拦下。报 409，让同步器下一轮重推。
+            # 并发创建同一身份 → 唯一约束拦下。报 409，让同步器下一轮重推。
             logger.warning("身份并发创建冲突 ext=%s", external_id)
             raise DocumentInProgressError() from None
 
-        # Redis 快路径 best-effort 跟上（DB 是权威；不一致会自愈）
-        if current is not None:
-            await release_mark(self.redis, current.content_hash)   # 旧内容不再 active
-        await check_and_mark(self.redis, content_hash)             # 新内容占位（幂等）
-
-        await self._remember_version(source, external_id, clean_row)   # write-through 快路径
+        # 提交成功之后才写 Redis（DB 是权威；不一致会自愈）
+        await self._apply_post_commit(post)
         logger.info(
             "%s 身份路径 ext=%s clean_id=%s",
-            "新增" if created else "更新", external_id, clean_row.id,
+            "新增" if result[1] else "更新", external_id, result[0].id,
         )
-        return clean_row, created, changed
+        return result
+
+    async def _apply_post_commit(self, post: _PostCommit) -> None:
+        """提交成功后执行 Redis 副作用：content_hash 按最终活跃状态、docver 按最终版本。"""
+        for content_hash, is_active in post.active.items():
+            if is_active:
+                await check_and_mark(self.redis, content_hash)   # 新内容占位（幂等）
+            else:
+                await release_mark(self.redis, content_hash)     # 旧内容不再 active
+        for (source, external_id), clean_row in post.versions.items():
+            await self._remember_version(source, external_id, clean_row)
 
     async def delete_document(self, payload: DocumentDelete) -> bool:
         """
@@ -485,23 +562,24 @@ class DocumentService:
 
     async def bulk_ingest(self, payloads: list[DocumentCreate]) -> BulkResult:
         """
-        批量摄入（同步器的真实调用方式）。 **与单篇走同一条路** ，只是不拿 Redis 锁：
+        批量摄入（同步器的真实调用方式）。 **与单篇走同一条路** ，只是不拿 Redis 锁。
 
-        1. 每篇先过 **身份版本快路径** —— 重推没变的文档在这一步就被挡掉，不查库、不加锁
-        2. 剩下的逐篇走 ``_apply_identified``， **不加分布式锁** ：
-           一次加锁 ≈ 2 次往返/篇，会把快路径省下的又加回去；
-           正确性交给 ``document_source`` 那一行的 **行锁 + 唯一约束**
-        3. 重复 **按条跳过** 、不报错：同步器周期重推是正常行为
+        事务按 ``settings.bulk_commit_size`` 切片：片内逐篇只 flush、片末 commit 一次。
 
-        按 **下标** 把结果填回同一个 ``items``，所以出参顺序与请求一致。
+        失败处理（见 ``_post_commit`` 与片级逻辑）：
+
+        - 片内任何异常 → 整片 rollback → 释放本片新增的 Redis 占位；
+        - 瞬时错误（1213/1205）先整片重试（最多 2 次），仍失败再逐篇重放；
+        - 其它错误直接逐篇重放 —— 复用单篇路径的分类语义；
+        - ``commit`` 成功后本片结果立即定稿；Redis 写后动作失败只记日志，绝不回滚/重放。
+
+        重复 **按条跳过** 、不报错：同步器周期重推是正常行为。
         """
         total = len(payloads)
         items: list[BulkItemResult | None] = [None] * total
 
         # ① 先全部标准化（纯函数、便宜），顺带挑出空正文的
         prepared: list[tuple[int, dict, dict]] = []   # (index, raw, cleaned)
-        # TODO: enumerate
-        #   遍历可迭代对象时，同时拿到「下标」和「元素」
         for i, payload in enumerate(payloads):
             raw = payload.model_dump()
             cleaned = normalize_document(raw)
@@ -511,42 +589,92 @@ class DocumentService:
             prepared.append((i, raw, cleaned))
 
         created = updated = duplicates = 0
+        attempted_write = False
+        batch_size = max(1, min(200, settings.bulk_commit_size))
 
-        for i, raw, cleaned in prepared:
-            # ② 快路径：重推没变的文档在这一步就打住（0 次查库、0 次加锁）
-            fast = await self._fast_skip(raw, cleaned)
-            if fast is not None:
-                duplicates += 1
-                items[i] = BulkItemResult(index=i, status="duplicate", id=fast.id)
-                continue
+        for start in range(0, len(prepared), batch_size):
+            chunk = prepared[start:start + batch_size]
+            results: dict[int, BulkItemResult] = {}
 
-            # ③ 库路径：逐篇走身份判断（不加 Redis 锁 —— 权威是那把行锁 + 唯一约束）
-            try:
-                clean_row, was_created, changed = await with_transient_retry(
-                    lambda: self._apply_identified(raw, cleaned),
-                    session=self.db,
-                )
-            except Exception:
-                await self.db.rollback()
-                logger.exception("批量落库失败 index=%d ext=%s", i, raw.get("external_id"))
-                items[i] = BulkItemResult(index=i, status="rejected")
-                continue
+            for attempt in range(3):        # 第一次 + 最多 2 次整片重试
+                post = _PostCommit()
+                marks: set[str] = set()
+                seen: dict[str, DocumentClean] = {}
+                dirty: set[tuple[str, str]] = set()
+                results = {}
+                try:
+                    for i, raw, cleaned in chunk:
+                        identity = (raw["source"], raw["external_id"])
+                        # 片内刚写过这个身份 → 不走快路径（缓存还是片前的旧版本）
+                        if identity not in dirty:
+                            fast = await self._fast_skip(raw, cleaned, count=False)
+                            if fast is not None:
+                                results[i] = BulkItemResult(
+                                    index=i, status="duplicate", id=fast.id
+                                )
+                                continue
+                        # 调用前就置位：即使调用中途抛异常，也按「尝试过写」bump 一次
+                        attempted_write = True
+                        clean_row, was_created, changed = await self._apply_identified_in_tx(
+                            raw,
+                            cleaned,
+                            post=post,
+                            marks_added=marks,
+                            seen_hashes=seen,
+                            dirty=dirty,
+                            count_rejected=False,
+                        )
+                        results[i] = self._bulk_item(i, clean_row, was_created, changed)
+                    await self.db.commit()       # 只读片也提交：结束事务/快照
+                except Exception as exc:
+                    await self.db.rollback()
+                    for h in marks:
+                        await release_mark(self.redis, h)     # 只补偿本片 SADD=1 的
+                    if is_transient_error(exc) and attempt < 2:
+                        logger.warning(
+                            "bulk 分片瞬时错误（%s），整片重试 %d/2 start=%d size=%d",
+                            type(exc).__name__, attempt + 1, start, len(chunk),
+                        )
+                        continue
+                    logger.warning(
+                        "bulk 分片回退逐篇 start=%d size=%d err=%s",
+                        start, len(chunk), type(exc).__name__,
+                    )
+                    results = await self._replay_chunk(chunk)
+                    break
+                else:
+                    # 【提交成功即定稿】post-commit 失败只记日志，绝不回滚/重放
+                    try:
+                        await self._apply_post_commit(post)
+                    except Exception:
+                        logger.warning(
+                            "post-commit Redis 动作失败（DB 已提交）start=%d", start,
+                            exc_info=True,
+                        )
+                    break
 
-            if not changed:
-                duplicates += 1
-                items[i] = BulkItemResult(index=i, status="duplicate", id=clean_row.id)
-            elif was_created:
-                created += 1
-                items[i] = BulkItemResult(index=i, status="created", id=clean_row.id)
-            else:
-                updated += 1
-                items[i] = BulkItemResult(index=i, status="updated", id=clean_row.id)
+            for i, res in results.items():
+                items[i] = res
+                if res.status == "created":
+                    created += 1
+                elif res.status == "updated":
+                    updated += 1
+                elif res.status == "duplicate":
+                    duplicates += 1
+            counts = {
+                s: sum(1 for r in results.values() if r.status == s)
+                for s in ("created", "updated", "duplicate", "rejected")
+            }
+            logger.info("bulk 分片完成 start=%d size=%d %s", start, len(chunk), counts)
 
-        if created or updated:
+        # 计数器按最终结果加一次（重放/回退不会重复计数）
+        await incr_rejected_by(self.redis, duplicates)
+        # 只要尝试过写就 bump：提交结果不确定时宁可多失效一次，也别漏
+        if created or updated or attempted_write:
             await bump_list_version(self.redis)
         logger.info(
-            "bulk_ingest 完成 收到=%d 新建=%d 更新=%d 重复=%d",
-            total, created, updated, duplicates,
+            "bulk_ingest 完成 收到=%d 新建=%d 更新=%d 重复=%d batch=%d",
+            total, created, updated, duplicates, batch_size,
         )
         return BulkResult(
             received=total,
@@ -555,4 +683,42 @@ class DocumentService:
             duplicates=duplicates,
             rejected=total - created - updated - duplicates,
             items=[it for it in items if it is not None],
+        )
+
+    async def _replay_chunk(
+        self, chunk: list[tuple[int, dict, dict]]
+    ) -> dict[int, BulkItemResult]:
+        """
+        整片回退后逐篇重放：复用 bulk 的逐篇语义（ **不拿 Redis 身份锁** ），
+        每篇一个事务 —— 正确性由已验证的单篇路径保证。
+        """
+        results: dict[int, BulkItemResult] = {}
+        for i, raw, cleaned in chunk:
+            fast = await self._fast_skip(raw, cleaned, count=False)
+            if fast is not None:
+                results[i] = BulkItemResult(index=i, status="duplicate", id=fast.id)
+                continue
+            try:
+                clean_row, was_created, changed = await with_transient_retry(
+                    lambda r=raw, c=cleaned: self._apply_identified_committed(
+                        r, c, count_rejected=False
+                    ),
+                    session=self.db,
+                )
+            except Exception:
+                await self.db.rollback()
+                logger.exception("批量落库失败 index=%d ext=%s", i, raw.get("external_id"))
+                results[i] = BulkItemResult(index=i, status="rejected")
+                continue
+            results[i] = self._bulk_item(i, clean_row, was_created, changed)
+        return results
+
+    @staticmethod
+    def _bulk_item(
+        i: int, clean_row: DocumentClean, was_created: bool, changed: bool
+    ) -> BulkItemResult:
+        if not changed:
+            return BulkItemResult(index=i, status="duplicate", id=clean_row.id)
+        return BulkItemResult(
+            index=i, status="created" if was_created else "updated", id=clean_row.id
         )

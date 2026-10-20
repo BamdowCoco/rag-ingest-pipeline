@@ -10,6 +10,7 @@ Alembic 环境（ **异步** 版）。
    把同步的 ``context.run_migrations()`` 丢进去跑。
 """
 import asyncio
+import contextlib
 from logging.config import fileConfig
 
 from alembic import context
@@ -41,6 +42,9 @@ config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"
 # autogenerate 拿它和数据库现状对比
 target_metadata = Base.metadata
 
+# 迁移咨询锁的名字：4 个 uvicorn worker 共享同一个库，必须串行迁移
+MIGRATION_LOCK = "rag_ingest_migrate"
+
 
 def run_migrations_offline() -> None:
     """离线模式：不连库，只把 SQL 打出来。"""
@@ -67,7 +71,24 @@ async def run_async_migrations() -> None:
         poolclass=pool.NullPool,
     )
     async with connectable.connect() as connection:
-        await connection.run_sync(do_run_migrations)
+        # 【多 worker 必备】每个 uvicorn worker 的 lifespan 都会跑 upgrade head。
+        # 用 MySQL 的连接级咨询锁把迁移串行化，否则多个进程会同时 DDL 同一个库。
+        # GET_LOCK 绑定在连接上，所以必须和迁移用同一个 connection（NullPool 正好保证）。
+        acquired = (
+            await connection.exec_driver_sql(
+                f"SELECT GET_LOCK('{MIGRATION_LOCK}', 30)"
+            )
+        ).scalar()
+        if acquired != 1:
+            raise RuntimeError("等待迁移锁超时：另一个进程正在迁移")
+        try:
+            await connection.run_sync(do_run_migrations)
+        finally:
+            # 连接断了 MySQL 会自动释放；这里吞掉异常，别掩盖迁移本身的错误
+            with contextlib.suppress(Exception):
+                await connection.exec_driver_sql(
+                    f"SELECT RELEASE_LOCK('{MIGRATION_LOCK}')"
+                )
     await connectable.dispose()
 
 

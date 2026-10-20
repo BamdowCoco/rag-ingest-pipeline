@@ -30,7 +30,10 @@ COPY alembic/ ./alembic/
 EXPOSE 8000
 
 # 不加 --reload：容器内不做热重载。改完代码重建即可：docker compose up -d --build api
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# --workers 默认 4，可用 API_WORKERS 覆盖；exec 保证 SIGTERM 能传到 uvicorn（优雅关停）。
+# 每个 worker 会各起一份后台循环（enrich / reclaim），两者都按 SKIP LOCKED / 条件 UPDATE
+# 实现，多进程安全。
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS:-4}"]
 
 
 # ---- 测试 stage（多阶段构建的第二个 target）----

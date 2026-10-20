@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     db_user: str = "app"
     db_password: str = "app"
     db_name: str = "rag_ingest"
+    # 每个 worker 的连接池。总连接数 = API_WORKERS × (size + overflow)；
+    # 4 × (5 + 10) = 60，低于 MySQL 默认 max_connections=151。
+    db_pool_size: int = 5
+    db_max_overflow: int = 10
 
     # ---------- Redis ----------
     redis_host: str = "redis"
@@ -47,6 +51,8 @@ class Settings(BaseSettings):
     # ---------- 业务参数 ----------
     cache_ttl: int = 60          # 列表/统计缓存秒数（阶段 7、8）
     lock_ttl_ms: int = 10000     # 分布式锁毫秒级 TTL（阶段 6）
+    # bulk 入口每多少篇提交一次事务；1 = 逐篇提交（退回旧行为，也是回滚开关）
+    bulk_commit_size: int = 10
 
     # ---------- 后台任务 ----------
     reclaim_interval_seconds: int = 60    # 回收任务多久跑一次

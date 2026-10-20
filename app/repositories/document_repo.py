@@ -146,6 +146,20 @@ class DocumentRepo:
         await self.db.flush()        # flush 只为拿自增 id 给 clean.source_id 用，≠ commit
         return row
 
+    async def get_active_by_id(self, clean_id: int) -> DocumentClean | None:
+        """
+        按 id 取 **当前版本**（已作废的返回 None）。
+
+        快路径兜底用：缓存里的 clean_id 可能已被并发的更新作废。
+        必须在 **SQL 层**过滤 ``superseded_at`` —— ``supersede_version`` 是 Core UPDATE，
+        identity map 里的 ORM 对象可能仍是旧值，只看对象属性会漏判。
+        """
+        stmt = select(DocumentClean).where(
+            DocumentClean.id == clean_id,
+            DocumentClean.superseded_at.is_(None),
+        )
+        return (await self.db.execute(stmt)).scalar_one_or_none()
+
     async def get_active_version(
         self, source_id: int, *, for_update: bool = False
     ) -> DocumentClean | None:

@@ -19,8 +19,8 @@ from app.core.config import settings
 engine = create_async_engine(
     settings.database_url,
     echo=settings.debug,        # 本地 DEBUG=true 才打印 SQL
-    pool_size=10,               # 池内常驻连接数
-    max_overflow=20,            # 峰值可临时超出的数量（总上限 = 10 + 20）
+    pool_size=settings.db_pool_size,          # 池内常驻连接数（每 worker）
+    max_overflow=settings.db_max_overflow,    # 峰值可临时超出的数量（总上限 = size + overflow）
     pool_recycle=3600,          # 连接活过 1 小时就回收，避免被 MySQL wait_timeout 掐断
     pool_pre_ping=True,         # 取连接前先 ping，坏了就重连（对付 wait_timeout 的另一道保险）
 )

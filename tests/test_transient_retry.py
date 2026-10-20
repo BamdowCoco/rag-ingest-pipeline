@@ -74,17 +74,17 @@ async def test_non_transient_error_is_not_retried():
 
 async def test_ingest_retries_deadlock_and_still_returns_201(client, make_doc, monkeypatch):
     """端到端：身份路径第一次死锁、第二次成功 → 请求仍返回 201。"""
-    original = DocumentService._apply_identified
+    original = DocumentService._apply_identified_in_tx
     calls = 0
 
-    async def flaky(self, raw, cleaned):
+    async def flaky(self, raw, cleaned, **kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:
             raise _operational(1213)
-        return await original(self, raw, cleaned)
+        return await original(self, raw, cleaned, **kwargs)
 
-    monkeypatch.setattr(DocumentService, "_apply_identified", flaky)
+    monkeypatch.setattr(DocumentService, "_apply_identified_in_tx", flaky)
 
     r = await client.post("/api/v1/documents", json=make_doc())
 
