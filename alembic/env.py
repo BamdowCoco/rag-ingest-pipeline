@@ -70,23 +70,30 @@ async def run_async_migrations() -> None:
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
-    async with connectable.connect() as connection:
-        # 【多 worker 必备】每个 uvicorn worker 的 lifespan 都会跑 upgrade head。
-        # 用 MySQL 的连接级咨询锁把迁移串行化，否则多个进程会同时 DDL 同一个库。
-        # GET_LOCK 绑定在连接上，所以必须和迁移用同一个 connection（NullPool 正好保证）。
+    # 【为什么用两条连接】GET_LOCK 是会话级锁，不要求迁移和它在同一个事务/快照里。
+    # 如果在同一条连接上先 GET_LOCK 再跑迁移，这条连接的第一条 SELECT 已经开启了
+    # REPEATABLE READ 事务；等锁期间别的 worker 提交的迁移对它不可见，后到的 worker
+    # 会拿着旧快照把 cleanup 再跑一遍，在 DROP INDEX 上报 1091。
+    # 所以：一条连接专门持锁，另一条【拿到锁之后才建立】的连接跑迁移，
+    # 新连接的第一条读必然能看到前一个 worker 已提交的 alembic_version。
+    async with connectable.connect() as lock_conn:
         acquired = (
-            await connection.exec_driver_sql(
+            await lock_conn.exec_driver_sql(
                 f"SELECT GET_LOCK('{MIGRATION_LOCK}', 30)"
             )
         ).scalar()
         if acquired != 1:
             raise RuntimeError("等待迁移锁超时：另一个进程正在迁移")
         try:
-            await connection.run_sync(do_run_migrations)
+            async with connectable.connect() as conn:
+                await conn.run_sync(do_run_migrations)
+                # MySQL 的 DDL 是非事务性的；显式提交一次，确保最后一条
+                # alembic_version UPDATE 落盘（否则版本表可能停在前一版）。
+                await conn.commit()
         finally:
             # 连接断了 MySQL 会自动释放；这里吞掉异常，别掩盖迁移本身的错误
             with contextlib.suppress(Exception):
-                await connection.exec_driver_sql(
+                await lock_conn.exec_driver_sql(
                     f"SELECT RELEASE_LOCK('{MIGRATION_LOCK}')"
                 )
     await connectable.dispose()
